@@ -32,11 +32,13 @@ static const char *TAG = "I2S_MIC_TEST";
 // 音频参数
 #define SAMPLE_RATE         16000   // 使用16kHz采样率
 #define BITS_PER_SAMPLE     16
-#define BUFFER_SIZE         2048
+#define BUFFER_SIZE         2048     // 读取缓冲区大小（样本数）
+#define DMA_BUF_LEN         512      // DMA缓冲区长度（必须 <= 1024，且 > 8）
 #define RECORD_DURATION_MS  10000    // 10秒录音
 
 // 音频缓冲区
-static int16_t mic_buffer[BUFFER_SIZE];    // 16位MIC输入缓冲区
+// 注意：WLED使用32位数据格式，需要匹配
+static int32_t mic_buffer[BUFFER_SIZE];    // 32位MIC输入缓冲区（与WLED一致）
 
 // I2S配置结构体（旧版API）
 static i2s_config_t i2s_config;
@@ -58,29 +60,38 @@ static esp_err_t init_i2s_microphone(void)
     ESP_LOGI(TAG, "初始化SPH0645L I2S麦克风 (ESP32-C3)...");
     ESP_LOGI(TAG, "引脚配置: WS=%d, SCK=%d, DIN=%d", I2S_MIC_WS_PIN, I2S_MIC_SCK_PIN, I2S_MIC_DIN_PIN);
     ESP_LOGI(TAG, "使用旧版I2S API (与WLED兼容)");
+    ESP_LOGW(TAG, "注意: WLED代码中ESP32-C3的SPH0645支持标记为'FIX ME'，可能存在兼容性问题");
+    ESP_LOGI(TAG, "硬件检查建议:");
+    ESP_LOGI(TAG, "  1. 确认SPH0645电源为3.3V (VDD)");
+    ESP_LOGI(TAG, "  2. 确认GND连接正确");
+    ESP_LOGI(TAG, "  3. 确认WS/SCK/DATA引脚连接正确");
+    ESP_LOGI(TAG, "  4. 确认引脚未被其他功能占用");
 
     // 先卸载可能存在的I2S驱动（参考WLED做法）
+    // 忽略错误，因为如果驱动未安装，这个错误是正常的
     i2s_driver_uninstall(I2S_NUM_0);
     vTaskDelay(pdMS_TO_TICKS(100));  // 给麦克风一些时间设置
 
     // 配置I2S（参考WLED的I2SSource配置）
+    // 关键发现：WLED默认使用32位数据格式，不是16位！
+    // ESP-IDF 5.4.x不在4.4.x的bug范围内，默认使用左通道
     i2s_config = (i2s_config_t){
         .mode = I2S_MODE_MASTER | I2S_MODE_RX,
         .sample_rate = SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // 单声道，左通道（参考WLED）
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // WLED使用32位格式！
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // 单声道左通道（与WLED一致）
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,  // 标准I2S格式（SPH0645需要）
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL2,
         .dma_buf_count = 8,           // DMA缓冲区数量（参考WLED）
-        .dma_buf_len = BUFFER_SIZE,   // DMA缓冲区长度
+        .dma_buf_len = DMA_BUF_LEN,   // DMA缓冲区长度（必须 <= 1024）
         .use_apll = false,            // ESP32-C3不支持APLL
-        .bits_per_chan = I2S_BITS_PER_CHAN_16BIT,
+        .bits_per_chan = I2S_BITS_PER_CHAN_32BIT,  // 32位通道数据
 #else
         .communication_format = I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
-        .dma_buf_len = BUFFER_SIZE,
+        .dma_buf_len = DMA_BUF_LEN,
         .use_apll = false
 #endif
     };
@@ -113,17 +124,19 @@ static esp_err_t init_i2s_microphone(void)
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 2, 0)
     // 步骤3: 设置I2S时钟（关键步骤，必须在i2s_set_pin之后调用）
     // 参考WLED: i2s_set_clk() after i2s_set_pin() for SPH0645
-    err = i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    // WLED使用32位格式和单声道模式
+    err = i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_MONO);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "设置I2S时钟失败: %s", esp_err_to_name(err));
         i2s_driver_uninstall(I2S_NUM_0);
         return err;
     }
-    ESP_LOGI(TAG, "I2S时钟配置成功 (采样率: %d Hz)", SAMPLE_RATE);
+    ESP_LOGI(TAG, "I2S时钟配置成功 (采样率: %d Hz, 32位, 单声道)", SAMPLE_RATE);
 #endif
 
     ESP_LOGI(TAG, "SPH0645L I2S麦克风初始化完成");
-    ESP_LOGI(TAG, "配置: 标准I2S格式, 16位, 单声道左通道, DMA缓冲区8x%d", BUFFER_SIZE);
+    ESP_LOGI(TAG, "配置: 标准I2S格式, 32位, 单声道左通道, DMA缓冲区8x%d", DMA_BUF_LEN);
+    ESP_LOGI(TAG, "注意: 使用32位格式（与WLED一致），数据需要提取低16位");
     
     return ESP_OK;
 }
@@ -144,32 +157,79 @@ static void mic_test_task(void *arg)
     ESP_LOGI(TAG, "开始读取麦克风数据...");
 
     while (is_recording) {
-        // 从I2S麦克风读取数据 (16位数据) - 旧版API (参考WLED)
+        // 从I2S麦克风读取数据 (32位数据) - 旧版API (参考WLED)
+        // WLED使用32位格式，需要匹配
         esp_err_t ret = i2s_read(I2S_NUM_0, (void *)mic_buffer,
-                                 BUFFER_SIZE * sizeof(int16_t),
+                                 BUFFER_SIZE * sizeof(int32_t),
                                  &bytes_read, portMAX_DELAY);
 
         if (ret == ESP_OK && bytes_read > 0) {
-            size_t samples_read = bytes_read / sizeof(int16_t);
+            size_t samples_read = bytes_read / sizeof(int32_t);
             total_samples += samples_read;
 
             // 打印每个缓冲区的麦克风数据
-            ESP_LOGI(TAG, "麦克风数据包 #%" PRIu32 ": %zu 样本", total_samples / samples_read, samples_read);
-
-            // 打印前16个样本
-            ESP_LOGI(TAG, "数据样本 (前16个):");
-            for (size_t i = 0; i < 16 && i < samples_read; i++) {
-                ESP_LOGI(TAG, "  [%zu]: %d", i, mic_buffer[i]);
+            ESP_LOGI(TAG, "麦克风数据包 #%" PRIu32 ": %zu 样本, 读取字节数: %zu (预期: %zu)", 
+                     total_samples / samples_read, samples_read, bytes_read, 
+                     BUFFER_SIZE * sizeof(int32_t));
+            
+            // 检查数据格式：如果bytes_read是samples_read的4倍，可能是32位数据
+            if (bytes_read == samples_read * 4) {
+                ESP_LOGW(TAG, "警告: 读取的字节数是样本数的4倍，可能是32位数据格式");
+            }
+            
+            // 检查是否有非零数据
+            bool has_nonzero = false;
+            for (size_t i = 0; i < samples_read && i < 100; i++) {
+                if (mic_buffer[i] != 0) {
+                    has_nonzero = true;
+                    break;
+                }
+            }
+            if (!has_nonzero) {
+                ESP_LOGW(TAG, "警告: 前100个样本全为0，可能是硬件连接问题或配置不匹配");
             }
 
-            // 计算音频统计信息
-            int32_t sum_squares = 0;
+            // 打印原始字节数据（前32字节，用于调试）
+            uint8_t *raw_bytes = (uint8_t *)mic_buffer;
+            char hex_str[128] = {0};
+            size_t hex_len = 0;
+            ESP_LOGI(TAG, "原始字节数据 (前32字节，十六进制):");
+            for (size_t i = 0; i < 32 && i < bytes_read; i++) {
+                if (i % 16 == 0) {
+                    if (i > 0) {
+                        ESP_LOGI(TAG, "%s", hex_str);
+                        hex_len = 0;
+                        memset(hex_str, 0, sizeof(hex_str));
+                    }
+                    hex_len += snprintf(hex_str + hex_len, sizeof(hex_str) - hex_len, "  [%04zx]: ", i);
+                }
+                hex_len += snprintf(hex_str + hex_len, sizeof(hex_str) - hex_len, "%02X ", raw_bytes[i]);
+            }
+            if (hex_len > 0) {
+                ESP_LOGI(TAG, "%s", hex_str);
+            }
+
+            // 打印前16个样本（32位格式，使用低16位提取）
+            // 根据测试结果，低16位提取方式更稳定和准确
+            ESP_LOGI(TAG, "数据样本 (前16个，使用低16位提取):");
+            for (size_t i = 0; i < 16 && i < samples_read; i++) {
+                int32_t sample32 = mic_buffer[i];
+                // 提取低16位（实际音频数据）
+                int16_t sample = (int16_t)(sample32 & 0xFFFF);
+                ESP_LOGI(TAG, "  [%zu]: raw32=0x%08" PRIX32 " -> 16bit=%d (0x%04X)", 
+                         i, (uint32_t)sample32, sample, (uint16_t)sample);
+            }
+
+            // 计算音频统计信息（使用低16位提取，根据测试结果这是正确的方式）
+            int64_t sum_squares = 0;
             int16_t max_sample = INT16_MIN;
             int16_t min_sample = INT16_MAX;
 
             for (size_t i = 0; i < samples_read; i++) {
-                int16_t sample = mic_buffer[i];
-                sum_squares += (int32_t)sample * sample;
+                int32_t sample32 = mic_buffer[i];
+                // 提取低16位（实际音频数据）
+                int16_t sample = (int16_t)(sample32 & 0xFFFF);
+                sum_squares += (int64_t)sample * sample;
                 if (sample > max_sample) max_sample = sample;
                 if (sample < min_sample) min_sample = sample;
             }
@@ -179,6 +239,15 @@ static void mic_test_task(void *arg)
 
             ESP_LOGI(TAG, "统计信息 - RMS: %.2f, 平均功率: %.0f, 峰值: %d/%d",
                      rms, avg_level, min_sample, max_sample);
+            
+            // 判断数据是否正常
+            if (rms > 100.0f && rms < 10000.0f) {
+                ESP_LOGI(TAG, "✓ 音频数据正常，RMS值在合理范围内");
+            } else if (rms < 10.0f) {
+                ESP_LOGW(TAG, "⚠ RMS值过小，可能是静音或数据提取不正确");
+            } else if (rms > 10000.0f) {
+                ESP_LOGW(TAG, "⚠ RMS值过大，可能数据溢出或提取不正确");
+            }
 
         } else if (ret != ESP_OK) {
             ESP_LOGE(TAG, "读取麦克风数据失败: %s", esp_err_to_name(ret));
@@ -251,7 +320,8 @@ void app_main(void)
     ESP_LOGI(TAG, "开发板: ESP32-C3 (RISC-V架构)");
     ESP_LOGI(TAG, "麦克风: SPH0645L (I2S数字麦克风)");
     ESP_LOGI(TAG, "API: 旧版I2S (i2s_driver_install) - 参考WLED实现");
-    ESP_LOGI(TAG, "通道格式: I2S_CHANNEL_FMT_ONLY_LEFT (单声道左通道)");
+    ESP_LOGI(TAG, "通道格式: I2S_CHANNEL_FMT_ONLY_LEFT (单声道左通道，与WLED一致)");
+    ESP_LOGI(TAG, "数据格式: 32位 (与WLED一致，需要提取低16位)");
     ESP_LOGI(TAG, "通信格式: I2S_COMM_FORMAT_STAND_I2S (标准I2S)");
     ESP_LOGI(TAG, "麦克风引脚配置:");
     ESP_LOGI(TAG, "  SD(DATA): GPIO%d", I2S_MIC_DIN_PIN);
