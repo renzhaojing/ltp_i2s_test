@@ -46,7 +46,7 @@ static const char *TAG = "ADC_MIC_TEST";
 #define SAMPLE_RATE            8000    // 目标采样率8kHz（软件定时器实际约500-1000Hz）
 #define BITS_PER_SAMPLE        12      // ADC为12位
 #define BUFFER_SIZE            1024    // 读取缓冲区大小（样本数）- 减小以更快显示统计
-#define RECORD_DURATION_MS     10000   // 10秒录音
+#define RECORD_DURATION_MS     20000   // 10秒录音
 #define ADC_SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE)  // 采样间隔（微秒）
 
 // 音频缓冲区
@@ -200,17 +200,35 @@ static void mic_test_task(void *arg)
             int16_t max_sample = INT16_MIN;
             int16_t min_sample = INT16_MAX;
             uint32_t sum_voltage = 0;
+            // 跟踪ADC原始值范围（在整个测试过程中）
+            static int adc_raw_min = 4095;
+            static int adc_raw_max = 0;
+            static bool first_buffer = true;
+            
+            if (first_buffer) {
+                adc_raw_min = 4095;  // 重置为最大值
+                adc_raw_max = 0;     // 重置为最小值
+                first_buffer = false;
+            }
 
+            // 计算绝对值的平均值（用于区分声音大小）
+            int64_t sum_abs = 0;
             for (size_t i = 0; i < BUFFER_SIZE; i++) {
                 int16_t s = mic_buffer[i];
                 sum_squares += (int64_t)s * s;
+                sum_abs += (s < 0) ? -s : s;  // 绝对值累加
                 if (s > max_sample) max_sample = s;
                 if (s < min_sample) min_sample = s;
                 // 计算原始电压（从样本值反推）
                 sum_voltage += (mic_buffer[i] + 2048) * 2500 / 4095;  // 估算电压
+                // 计算ADC原始值范围（从16位样本值反推）
+                int adc_raw_val = mic_buffer[i] + 2048;
+                if (adc_raw_val < adc_raw_min) adc_raw_min = adc_raw_val;
+                if (adc_raw_val > adc_raw_max) adc_raw_max = adc_raw_val;
             }
 
             float rms = sqrt((float)sum_squares / BUFFER_SIZE);
+            float avg_abs = (float)sum_abs / BUFFER_SIZE;  // 绝对值的平均值
             float avg_voltage = (float)sum_voltage / BUFFER_SIZE;
 
             uint32_t elapsed = (esp_timer_get_time() / 1000) - start_time;
@@ -219,8 +237,69 @@ static void mic_test_task(void *arg)
             static uint32_t last_print_time = 0;
             if (elapsed - last_print_time >= 1000 || elapsed < 1000) {
                 int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
-                ESP_LOGI(TAG, "进度: %" PRIu32 " ms | 样本: %" PRIu32 " | RMS: %.1f | 峰值: %d/%d (峰峰值: %d) | 平均电压: %.1f mV", 
-                         elapsed, total_samples, rms, min_sample, max_sample, peak_to_peak, avg_voltage);
+                // 计算ADC原始值范围
+                int adc_raw_range_min = min_sample + 2048;  // 16位最小值转回ADC原始值
+                int adc_raw_range_max = max_sample + 2048;  // 16位最大值转回ADC原始值
+                // 计算平均ADC原始值（反映声音的平均电平）
+                float avg_adc_raw = avg_voltage * 4095.0f / 2500.0f;
+                
+                ESP_LOGI(TAG, "进度: %" PRIu32 " ms | 样本: %" PRIu32 " | RMS: %.1f | 峰值: %d/%d (峰峰值: %d)", 
+                         elapsed, total_samples, rms, min_sample, max_sample, peak_to_peak);
+                ESP_LOGI(TAG, "  音量指标: RMS=%.1f | 平均绝对值=%.1f | 平均ADC=%.1f | 平均电压=%.1f mV", 
+                         rms, avg_abs, avg_adc_raw, avg_voltage);
+                ESP_LOGI(TAG, "  ADC原始值范围: %d-%d (12位, 0-4095) | 电压范围: %.1f-%.1f mV", 
+                         adc_raw_range_min, adc_raw_range_max,
+                         (float)adc_raw_range_min * 2500.0f / 4095.0f,
+                         (float)adc_raw_range_max * 2500.0f / 4095.0f);
+                ESP_LOGI(TAG, "  历史ADC范围: %d-%d (总范围: %d)", 
+                         adc_raw_min, adc_raw_max, adc_raw_max - adc_raw_min);
+                
+                // 声音大小判断（使用动态阈值和相对值）
+                // 根据实际数据调整：静音时RMS约1590，拍打时RMS约1575-1600
+                // 使用峰峰值作为主要指标，RMS作为辅助
+                static float baseline_rms = 0.0f;  // 基线RMS值（静音时的RMS）
+                static bool baseline_set = false;
+                
+                // 初始化基线（静音时的RMS值）
+                if (!baseline_set && peak_to_peak < 20) {
+                    baseline_rms = rms;
+                    baseline_set = true;
+                    ESP_LOGI(TAG, "  📊 设置静音基线: RMS=%.1f", baseline_rms);
+                }
+                
+                // 使用峰峰值作为主要音量指标（更敏感）
+                const int PEAK_LOW = 50;    // 峰峰值阈值：低音量
+                const int PEAK_MID = 200;   // 峰峰值阈值：中音量
+                const int PEAK_HIGH = 500;  // 峰峰值阈值：高音量
+                
+                // RMS相对变化（相对于基线）
+                float rms_change = 0.0f;
+                if (baseline_set) {
+                    rms_change = rms - baseline_rms;
+                }
+                
+                // 音量等级判断（优先使用峰峰值）
+                const char* volume_level;
+                if (peak_to_peak < PEAK_LOW) {
+                    volume_level = "静音/极低";
+                } else if (peak_to_peak < PEAK_MID) {
+                    volume_level = "低";
+                } else if (peak_to_peak < PEAK_HIGH) {
+                    volume_level = "中";
+                } else {
+                    volume_level = "高";
+                }
+                
+                ESP_LOGI(TAG, "  🔊 音量等级: %s | 峰峰值=%d | RMS=%.1f (变化=%.1f) | 平均绝对值=%.1f", 
+                         volume_level, peak_to_peak, rms, rms_change, avg_abs);
+                
+                // 音量强度百分比（基于峰峰值，归一化到0-100%）
+                float volume_percent = 0.0f;
+                if (peak_to_peak > PEAK_LOW) {
+                    volume_percent = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW)) * 100.0f;
+                    if (volume_percent > 100.0f) volume_percent = 100.0f;
+                }
+                ESP_LOGI(TAG, "  📈 音量强度: %.1f%% (基于峰峰值)", volume_percent);
                 last_print_time = elapsed;
                 
                 // 判断数据变化情况
