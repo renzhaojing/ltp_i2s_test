@@ -14,6 +14,8 @@
 #include "esp_timer.h"
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
+#include "driver/rmt_tx.h"
+#include "ws2812_driver.h"
 
 static const char *TAG = "ADC_MIC_TEST";
 
@@ -31,6 +33,11 @@ static const char *TAG = "ADC_MIC_TEST";
 #define ADC_MIC_PIN            GPIO_NUM_2   // ADC输入引脚 (GPIO2 = ADC_CHANNEL_2)
 #define ADC_MIC_CHANNEL        ADC_CHANNEL_2  // ADC通道2 (新API使用ADC_CHANNEL_X)
 
+// WS2812 LED灯带配置
+#define LED_STRIP_PIN          GPIO_NUM_7   // WS2812数据引脚（可根据实际硬件修改）
+#define LED_STRIP_NUM          16           // LED数量
+#define LED_UPDATE_INTERVAL_MS 50           // LED更新间隔（50ms），更快响应
+
 // GPIO到ADC通道映射表（ESP32-C3）
 // GPIO0 -> ADC1_CHANNEL_0
 // GPIO1 -> ADC1_CHANNEL_1
@@ -45,9 +52,11 @@ static const char *TAG = "ADC_MIC_TEST";
 // 如需更高采样率，建议使用硬件定时器或DMA方式
 #define SAMPLE_RATE            8000    // 目标采样率8kHz（软件定时器实际约500-1000Hz）
 #define BITS_PER_SAMPLE        12      // ADC为12位
-#define BUFFER_SIZE            1024    // 读取缓冲区大小（样本数）- 减小以更快显示统计
-#define RECORD_DURATION_MS     20000   // 10秒录音
+#define BUFFER_SIZE            50      // 读取缓冲区大小（样本数）- 约6.25ms数据，极快响应
+#define RECORD_DURATION_MS     60000   // 20秒录音
 #define ADC_SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE)  // 采样间隔（微秒）
+#define AUDIO_UPDATE_INTERVAL_MS 50   // 音频统计更新间隔（50ms），更快响应
+#define LED_UPDATE_INTERVAL_MS 50     // LED更新间隔（50ms），更快响应
 
 // 音频缓冲区
 static int16_t mic_buffer[BUFFER_SIZE];    // 16位MIC输入缓冲区（12位ADC数据转换为16位）
@@ -59,6 +68,25 @@ static bool adc_calibration_init = false;
 
 // 状态标志
 static volatile bool is_recording = false;
+
+// LED灯带句柄
+static ws2812_handle_t *led_strip = NULL;
+
+// 音频数据共享（用于LED控制）
+typedef struct {
+    int peak_to_peak;      // 峰峰值
+    float rms;             // RMS值
+    float volume_percent;  // 音量强度百分比
+    bool updated;          // 数据是否更新
+} audio_data_t;
+
+static audio_data_t audio_data = {0};
+static SemaphoreHandle_t audio_data_mutex = NULL;
+
+// 函数声明
+static void mic_test_task(void *arg);
+static void led_control_task(void *arg);
+static esp_err_t init_led_strip(void);
 
 /**
  * @brief 初始化ADC模拟麦克风
@@ -139,21 +167,18 @@ static void mic_test_task(void *arg)
     size_t buffer_idx = 0;
 
     while (is_recording) {
-        // 控制采样率：等待到下一个采样时间
+        // 控制采样率：为了更快响应，减少延迟等待
         int64_t current_time = esp_timer_get_time();
         int64_t elapsed = current_time - last_sample_time;
         
         if (elapsed < ADC_SAMPLE_INTERVAL_US) {
-            // 使用vTaskDelay让出CPU时间，避免看门狗超时
-            // 注意：FreeRTOS的vTaskDelay最小延迟约1个tick（通常10ms），无法精确控制微秒级延迟
-            // 实际采样率会略低于目标值，但可以避免CPU占用过高和看门狗超时
+            // 为了更快响应，只等待较长的延迟（>=5ms）
+            // 对于短延迟，直接采样以提高响应速度
             int64_t wait_us = ADC_SAMPLE_INTERVAL_US - elapsed;
-            if (wait_us >= 1000) {
-                // 如果等待时间大于等于1ms，使用vTaskDelay
+            if (wait_us >= 5000) {  // 只等待>=5ms的延迟
                 vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
             } else {
-                // 如果等待时间小于1ms，至少延迟1个tick让出CPU给IDLE任务
-                // 这样可以避免看门狗超时
+                // 短延迟时，至少延迟1个tick让出CPU给IDLE任务
                 vTaskDelay(1);
             }
             continue;
@@ -193,7 +218,7 @@ static void mic_test_task(void *arg)
         buffer_idx++;
         total_samples++;
 
-        // 当缓冲区满时，处理并打印数据
+        // 当缓冲区满时，立即处理数据（不等待，实时响应）
         if (buffer_idx >= BUFFER_SIZE) {
             // 计算音频统计信息
             int64_t sum_squares = 0;
@@ -233,10 +258,37 @@ static void mic_test_task(void *arg)
 
             uint32_t elapsed = (esp_timer_get_time() / 1000) - start_time;
 
-            // 每秒打印一次统计信息（或缓冲区满时打印）
+            // 每50ms更新一次音频数据（用于LED控制），减少日志打印频率
+            static uint32_t last_update_time = 0;
             static uint32_t last_print_time = 0;
-            if (elapsed - last_print_time >= 1000 || elapsed < 1000) {
-                int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
+            
+            // 总是更新音频数据到共享结构体（用于LED控制，实时响应）
+            int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
+            float volume_percent = 0.0f;
+            const int PEAK_LOW = 5;    // 进一步降低阈值，提高灵敏度（正常说话也能检测）
+            const int PEAK_HIGH = 200; // 降低高音量阈值，让正常说话也能达到较高百分比
+            if (peak_to_peak > PEAK_LOW) {
+                // 使用平方根映射，增强低音量响应
+                float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
+                normalized = sqrtf(normalized);  // 平方根映射
+                volume_percent = normalized * 100.0f;
+                if (volume_percent > 100.0f) volume_percent = 100.0f;
+            }
+            
+            // 实时更新音频数据（不等待打印时间）
+            if (audio_data_mutex != NULL) {
+                if (xSemaphoreTake(audio_data_mutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+                    audio_data.peak_to_peak = peak_to_peak;
+                    audio_data.rms = rms;
+                    audio_data.volume_percent = volume_percent;
+                    audio_data.updated = true;
+                    xSemaphoreGive(audio_data_mutex);
+                }
+            }
+            
+            // 每500ms打印一次统计信息（减少日志输出，提高性能）
+            if (elapsed - last_print_time >= 500 || elapsed < 500) {
+                // peak_to_peak已在上面计算
                 // 计算ADC原始值范围
                 int adc_raw_range_min = min_sample + 2048;  // 16位最小值转回ADC原始值
                 int adc_raw_range_max = max_sample + 2048;  // 16位最大值转回ADC原始值
@@ -268,9 +320,9 @@ static void mic_test_task(void *arg)
                 }
                 
                 // 使用峰峰值作为主要音量指标（更敏感）
-                const int PEAK_LOW = 50;    // 峰峰值阈值：低音量
-                const int PEAK_MID = 200;   // 峰峰值阈值：中音量
-                const int PEAK_HIGH = 500;  // 峰峰值阈值：高音量
+                const int PEAK_LOW = 5;     // 峰峰值阈值：低音量（进一步降低，正常说话也能检测）
+                const int PEAK_MID = 80;    // 峰峰值阈值：中音量（降低）
+                const int PEAK_HIGH = 200;  // 峰峰值阈值：高音量（降低，让正常说话也能达到中高音量）
                 
                 // RMS相对变化（相对于基线）
                 float rms_change = 0.0f;
@@ -294,12 +346,15 @@ static void mic_test_task(void *arg)
                          volume_level, peak_to_peak, rms, rms_change, avg_abs);
                 
                 // 音量强度百分比（基于峰峰值，归一化到0-100%）
-                float volume_percent = 0.0f;
+                // 注意：这里的volume_percent仅用于日志显示，LED控制使用的是上面计算的volume_percent
+                float volume_percent_log = 0.0f;
                 if (peak_to_peak > PEAK_LOW) {
-                    volume_percent = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW)) * 100.0f;
-                    if (volume_percent > 100.0f) volume_percent = 100.0f;
+                    float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
+                    normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
+                    volume_percent_log = normalized * 100.0f;
+                    if (volume_percent_log > 100.0f) volume_percent_log = 100.0f;
                 }
-                ESP_LOGI(TAG, "  📈 音量强度: %.1f%% (基于峰峰值)", volume_percent);
+                ESP_LOGI(TAG, "  📈 音量强度: %.1f%% (基于峰峰值)", volume_percent_log);
                 last_print_time = elapsed;
                 
                 // 判断数据变化情况
@@ -310,8 +365,8 @@ static void mic_test_task(void *arg)
                 }
             }
 
-            // 打印前16个样本（每100ms打印一次）
-            if (elapsed % 100 == 0) {
+            // 打印前16个样本（每500ms打印一次，减少日志输出）
+            if (elapsed % 500 == 0) {
                 ESP_LOGI(TAG, "ADC数据样本 (前16个，12位ADC转换为16位):");
                 for (size_t i = 0; i < 16 && i < BUFFER_SIZE; i++) {
                     int16_t sample = mic_buffer[i];
@@ -365,10 +420,173 @@ static void start_mic_test(void)
 
     is_recording = true;
 
+    // 创建互斥锁（如果还没有创建）
+    if (audio_data_mutex == NULL) {
+        audio_data_mutex = xSemaphoreCreateMutex();
+        if (audio_data_mutex == NULL) {
+            ESP_LOGE(TAG, "创建音频数据互斥锁失败");
+            return;
+        }
+    }
+
     // 创建ADC模拟麦克风测试任务
     xTaskCreate(mic_test_task, "adc_mic_test_task", 4096, NULL, 5, NULL);
+    
+    // 创建LED控制任务
+    xTaskCreate(led_control_task, "led_control_task", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "ADC模拟麦克风测试已启动，测试时长: %d ms", RECORD_DURATION_MS);
+    ESP_LOGI(TAG, "LED灯带控制已启动，更新间隔: %d ms", LED_UPDATE_INTERVAL_MS);
+}
+
+/**
+ * @brief 初始化WS2812 LED灯带
+ */
+static esp_err_t init_led_strip(void)
+{
+    ESP_LOGI(TAG, "初始化WS2812 LED灯带...");
+    ESP_LOGI(TAG, "LED引脚: GPIO%d, LED数量: %d", LED_STRIP_PIN, LED_STRIP_NUM);
+    
+    esp_err_t ret = ws2812_init(LED_STRIP_PIN, LED_STRIP_NUM, &led_strip);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "初始化WS2812失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // 清除LED
+    ret = ws2812_clear(led_strip);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "清除LED失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ret = ws2812_refresh(led_strip);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "刷新LED失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "WS2812 LED灯带初始化成功");
+    return ESP_OK;
+}
+
+/**
+ * @brief LED流水效果控制任务
+ */
+static void led_control_task(void *arg)
+{
+    ESP_LOGI(TAG, "LED控制任务启动");
+    
+    uint32_t flow_position = 0;  // 流水位置
+    uint32_t last_update_time = 0;
+    
+    while (is_recording) {
+        uint32_t current_time = esp_timer_get_time() / 1000;
+        
+        // 每50ms更新一次LED（更快响应）
+        if (current_time - last_update_time >= LED_UPDATE_INTERVAL_MS) {
+            // 获取音频数据
+            int peak_to_peak = 0;
+            float volume_percent = 0.0f;
+            
+            if (xSemaphoreTake(audio_data_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                peak_to_peak = audio_data.peak_to_peak;
+                volume_percent = audio_data.volume_percent;
+                audio_data.updated = false;
+                xSemaphoreGive(audio_data_mutex);
+            }
+            
+            // 根据峰峰值计算要亮的LED数量
+            // 使用非线性映射，让低音量也能点亮更多LED
+            int led_count = 0;
+            const int PEAK_MIN = 5;    // 最小峰峰值阈值（进一步降低，提高灵敏度）
+            const int PEAK_MAX = 300;   // 最大峰峰值（降低范围，让正常说话也能触发更多LED）
+            
+            if (peak_to_peak > PEAK_MIN) {
+                // 使用平方根映射，让低音量范围有更大的响应
+                // 这样正常说话（低音量）也能点亮更多LED
+                float normalized = ((float)(peak_to_peak - PEAK_MIN) / (PEAK_MAX - PEAK_MIN));
+                normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
+                led_count = (int)(normalized * LED_STRIP_NUM) + 1;  // 至少亮1个LED
+                if (led_count > LED_STRIP_NUM) led_count = LED_STRIP_NUM;
+            } else {
+                led_count = 0;  // 静音时不亮LED
+            }
+            
+            // 流水效果：根据音量强度移动起始位置
+            // 音量越大，流水速度越快（1-10步/100ms）
+            int flow_speed = 1;  // 默认速度
+            if (volume_percent > 0) {
+                flow_speed = (int)(volume_percent / 10.0f) + 1;  // 1-11的速度
+                if (flow_speed > 10) flow_speed = 10;  // 最大速度限制
+            }
+            flow_position = (flow_position + flow_speed) % (LED_STRIP_NUM * 2);
+            
+            if (led_strip != NULL) {
+                // 清除所有LED
+                ws2812_clear(led_strip);
+                
+                // 根据音量设置LED颜色和亮度
+                // 音量越大，颜色越亮（从绿色->黄色->红色）
+                uint8_t r = 0, g = 0, b = 0;
+                if (volume_percent > 0) {
+                    if (volume_percent < 15.0f) {
+                        // 极低音量：暗绿色（让正常说话也能看到）
+                        g = (uint8_t)(100 + 100 * volume_percent / 15.0f);  // 100-200，更明显
+                    } else if (volume_percent < 40.0f) {
+                        // 低音量：绿色（正常说话范围）
+                        g = (uint8_t)(200 + 55 * (volume_percent - 15.0f) / 25.0f);  // 200-255
+                    } else if (volume_percent < 70.0f) {
+                        // 中音量：黄色（绿+红）
+                        g = 255;
+                        r = (uint8_t)(255 * (volume_percent - 40.0f) / 30.0f);
+                    } else {
+                        // 高音量：红色
+                        r = 255;
+                        g = (uint8_t)(255 * (100.0f - volume_percent) / 30.0f);
+                    }
+                }
+                
+                // 流水效果：从flow_position开始点亮led_count个LED
+                // 实现流水效果：LED从一端流向另一端
+                for (int i = 0; i < led_count; i++) {
+                    // 计算LED位置（流水方向：从0到LED_STRIP_NUM-1）
+                    int pos = (flow_position / 2 + i) % LED_STRIP_NUM;
+                    
+                    // 渐变效果：前面的LED最亮，后面的逐渐变暗
+                    float brightness = 1.0f;
+                    if (led_count > 1) {
+                        brightness = 1.0f - ((float)i / (float)led_count) * 0.7f;  // 亮度从1.0到0.3
+                    }
+                    if (brightness < 0.3f) brightness = 0.3f;  // 最小亮度
+                    
+                    uint8_t led_r = (uint8_t)(r * brightness);
+                    uint8_t led_g = (uint8_t)(g * brightness);
+                    uint8_t led_b = (uint8_t)(b * brightness);
+                    
+                    ws2812_set_pixel(led_strip, pos, led_r, led_g, led_b);
+                }
+                
+                // 刷新LED显示
+                ws2812_refresh(led_strip);
+            }
+            
+            last_update_time = current_time;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5));  // 5ms延迟，更快响应
+    }
+    
+    // 清除LED
+    if (led_strip != NULL) {
+        ws2812_clear(led_strip);
+        ws2812_refresh(led_strip);
+        ws2812_deinit(led_strip);
+        led_strip = NULL;
+    }
+    
+    ESP_LOGI(TAG, "LED控制任务结束");
+    vTaskDelete(NULL);
 }
 
 /**
@@ -404,7 +622,19 @@ void app_main(void)
     ESP_LOGI(TAG, "  衰减: 12dB (有效范围: 0-2500mV)");
     ESP_LOGI(TAG, "  分辨率: 12位");
     ESP_LOGI(TAG, "  采样率: %d Hz", SAMPLE_RATE);
+    ESP_LOGI(TAG, "LED配置:");
+    ESP_LOGI(TAG, "  LED引脚: GPIO%d", LED_STRIP_PIN);
+    ESP_LOGI(TAG, "  LED数量: %d", LED_STRIP_NUM);
+    ESP_LOGI(TAG, "  LED更新间隔: %d ms", LED_UPDATE_INTERVAL_MS);
+    ESP_LOGI(TAG, "  音频更新间隔: %d ms", AUDIO_UPDATE_INTERVAL_MS);
     ESP_LOGI(TAG, "===================================");
+
+    // 初始化WS2812 LED灯带
+    ESP_LOGI(TAG, "=== 初始化WS2812 LED灯带 ===");
+    esp_err_t led_init_err = init_led_strip();
+    if (led_init_err != ESP_OK) {
+        ESP_LOGW(TAG, "LED灯带初始化失败: %s，将继续运行但不显示LED效果", esp_err_to_name(led_init_err));
+    }
 
     // 初始化ADC模拟麦克风
     esp_err_t init_err = init_adc_microphone();
