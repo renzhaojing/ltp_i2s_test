@@ -1,0 +1,444 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_sleep.h"
+
+static const char *TAG = "I2S_MIC_TEST";
+
+// I2S麦克风引脚配置
+#define I2S_MIC_WS_PIN      GPIO_NUM_48  // 字时钟引脚
+#define I2S_MIC_SCK_PIN     GPIO_NUM_40  // 位时钟引脚
+#define I2S_MIC_DIN_PIN     GPIO_NUM_39  // 数据输入引脚
+
+// 喇叭引脚配置 (I2S标准模式)
+#define SPEAKER_DOUT_PIN    GPIO_NUM_13  // 数据输出引脚
+#define SPEAKER_BCLK_PIN    GPIO_NUM_14  // 位时钟引脚
+#define SPEAKER_LRCK_PIN    GPIO_NUM_21  // 左/右时钟引脚
+#define SPEAKER_MUTE_PIN    GPIO_NUM_47  // 静音控制引脚
+
+// 音频参数
+#define SAMPLE_RATE         16000   // 使用16kHz，PDM通常用这个频率
+#define BITS_PER_SAMPLE     16
+#define BUFFER_SIZE         1024
+#define RECORD_DURATION_MS  10000    // 10秒录音
+
+// 音频缓冲区
+static int32_t mic_buffer[BUFFER_SIZE];    // 32位MIC输入缓冲区
+static int16_t playback_buffer[BUFFER_SIZE]; // 16位播放缓冲区
+
+// I2S句柄
+static i2s_chan_handle_t pdm_rx_handle = NULL;
+static i2s_chan_handle_t speaker_tx_handle = NULL;
+
+// 状态标志
+static volatile bool is_recording = false;
+static volatile bool is_playing = false;
+
+/**
+ * @brief 生成正弦波音频数据
+ * @param buffer 音频缓冲区
+ * @param samples 采样点数量
+ * @param frequency 正弦波频率(Hz)
+ * @param amplitude 振幅(0-32767)
+ */
+static void generate_sine_wave(int16_t *buffer, size_t samples, float frequency, int16_t amplitude)
+{
+    float phase = 0.0f;
+    float phase_increment = 2.0f * M_PI * frequency / SAMPLE_RATE;
+
+    for (size_t i = 0; i < samples; i++) {
+        buffer[i] = (int16_t)(amplitude * sinf(phase));
+        phase += phase_increment;
+        if (phase >= 2.0f * M_PI) {
+            phase -= 2.0f * M_PI;  // 防止相位溢出
+        }
+    }
+}
+
+/**
+ * @brief 初始化GPIO17控制引脚
+ */
+static esp_err_t init_control_gpio(void)
+{
+    ESP_LOGI(TAG, "初始化GPIO17控制引脚...");
+
+    // 配置GPIO17为输出模式
+    gpio_config_t gpio_conf = {
+        .pin_bit_mask = (1ULL << SPEAKER_MUTE_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    esp_err_t ret = gpio_config(&gpio_conf);
+    if (ret == ESP_OK) {
+        // 设置GPIO17为高电平
+        gpio_set_level(SPEAKER_MUTE_PIN, 1);
+        ESP_LOGI(TAG, "GPIO17已设置为高电平");
+    } else {
+        ESP_LOGE(TAG, "GPIO17初始化失败: %s", esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/**
+ * @brief 初始化喇叭MUTE控制引脚
+ */
+static esp_err_t init_speaker_mute_gpio(void)
+{
+    ESP_LOGI(TAG, "初始化喇叭MUTE控制引脚...");
+
+    // 配置喇叭MUTE引脚为输出模式
+    gpio_config_t gpio_conf = {
+        .pin_bit_mask = (1ULL << SPEAKER_MUTE_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    esp_err_t ret = gpio_config(&gpio_conf);
+    if (ret == ESP_OK) {
+        // 设置MUTE引脚为高电平，使喇叭可用
+        gpio_set_level(SPEAKER_MUTE_PIN, 1);
+        ESP_LOGI(TAG, "喇叭MUTE引脚已设置为高电平，喇叭已启用");
+    } else {
+        ESP_LOGE(TAG, "喇叭MUTE引脚初始化失败: %s", esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+/**
+ * @brief 初始化I2S麦克风 (使用标准I2S模式)
+ */
+static esp_err_t init_i2s_microphone(void)
+{
+    ESP_LOGI(TAG, "初始化I2S麦克风...");
+    ESP_LOGI(TAG, "引脚配置: WS=%d, SCK=%d, DIN=%d", I2S_MIC_WS_PIN, I2S_MIC_SCK_PIN, I2S_MIC_DIN_PIN);
+
+    // I2S通道配置
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(0, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &pdm_rx_handle));
+
+    // I2S标准配置 (用于接收)
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_24BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
+            .slot_mode = I2S_SLOT_MODE_MONO,
+            .slot_mask = I2S_STD_SLOT_LEFT,  // 左声道
+            .ws_width = 32,
+            .ws_pol = false,
+            .bit_shift = false,
+            .left_align = false,
+            .big_endian = false,
+            .bit_order_lsb = false,
+        },
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_MIC_SCK_PIN,
+            .ws = I2S_MIC_WS_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din = I2S_MIC_DIN_PIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(pdm_rx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(pdm_rx_handle));
+
+    ESP_LOGI(TAG, "I2S麦克风初始化成功 (采样率: %d Hz)", SAMPLE_RATE);
+    return ESP_OK;
+}
+
+/**
+ * @brief 初始化喇叭 (标准I2S)
+ */
+static esp_err_t init_speaker(void)
+{
+    ESP_LOGI(TAG, "初始化喇叭...");
+    ESP_LOGI(TAG, "引脚配置: BCLK=%d, LRCK=%d, DOUT=%d, MUTE=%d",
+             SPEAKER_BCLK_PIN, SPEAKER_LRCK_PIN, SPEAKER_DOUT_PIN, SPEAKER_MUTE_PIN);
+    
+    // I2S通道配置
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(1, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &speaker_tx_handle, NULL));
+    
+    // I2S标准配置
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+            .slot_mode = I2S_SLOT_MODE_MONO,
+            .slot_mask = I2S_STD_SLOT_RIGHT, // 开发板为 left，我们的板子为 right
+            .ws_width = I2S_DATA_BIT_WIDTH_32BIT,
+            .ws_pol = false,
+            .bit_shift = false,
+            .left_align = false,
+            .big_endian = false,
+            .bit_order_lsb = false,
+        },
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SPEAKER_BCLK_PIN,
+            .ws = SPEAKER_LRCK_PIN,
+            .dout = SPEAKER_DOUT_PIN,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(speaker_tx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(speaker_tx_handle));
+
+    // 初始化喇叭MUTE控制
+    ESP_ERROR_CHECK(init_speaker_mute_gpio());
+
+    ESP_LOGI(TAG, "喇叭初始化成功");
+    return ESP_OK;
+}
+
+/**
+ * @brief I2S数据读取和处理任务
+ * 处理流程：
+ * 1. 从MIC读取32位数据到mic_buffer
+ * 2. 应用用户指定的算法：value >> 8, 然后 / 256，转换为16位
+ * 3. 输出16位数据到playback_buffer，通过喇叭播放
+ */
+static void i2s_record_task(void *arg)
+{
+    ESP_LOGI(TAG, "I2S录音任务启动");
+    
+    size_t bytes_read = 0;
+    uint32_t total_samples = 0;
+    uint32_t start_time = esp_timer_get_time() / 1000;
+    
+    // 音频处理参数
+    float gain = 1.0f;  // 增益调整
+    
+    while (is_recording) {
+        // 从I2S麦克风读取数据 (32位数据)
+        esp_err_t ret = i2s_channel_read(pdm_rx_handle, mic_buffer,
+                                        BUFFER_SIZE * sizeof(int32_t),
+                                        &bytes_read, portMAX_DELAY);
+
+        // 调试：记录读取统计（低频打印）
+        static uint32_t read_count = 0;
+        read_count++;
+        if (read_count % 100 == 0) {  // 每100次读取打印一次
+            ESP_LOGD(TAG, "I2S读取 #%" PRIu32 ": %zu 字节 (%zu 样本)",
+                     read_count, bytes_read, bytes_read / sizeof(int32_t));
+        }
+
+        if (ret == ESP_OK && bytes_read > 0) {
+            size_t samples_read = bytes_read / sizeof(int32_t);
+            total_samples += samples_read;
+
+            // 调试：打印前几个32位录音样本（只在第一次读取时打印）
+            static bool first_debug_print = true;
+            if (first_debug_print && samples_read > 0) {
+                ESP_LOGI(TAG, "32位录音数据样本 (前8个):");
+                for (size_t i = 0; i < 8 && i < samples_read; i++) {
+                    ESP_LOGI(TAG, "  样本[%zu]: %" PRId32, i, mic_buffer[i]);
+                }
+                first_debug_print = false;
+            }
+
+            // 用户指定的音频处理算法
+            for (size_t i = 0; i < samples_read; i++) {
+                int32_t value = mic_buffer[i] >> 8;
+                int64_t temp = (int64_t)value / 256; // 使用 int64_t 进行除法运算
+                playback_buffer[i] = (temp > INT16_MAX) ? INT16_MAX : (temp < INT16_MIN) ? INT16_MIN : (int16_t)temp;
+            }
+
+            // 调试：打印处理后的16位样本（只在第一次处理时打印）
+            static bool first_processed_debug_print = true;
+            if (first_processed_debug_print && samples_read > 0) {
+                ESP_LOGI(TAG, "处理后16位数据样本 (前8个):");
+                for (size_t i = 0; i < 8 && i < samples_read; i++) {
+                    ESP_LOGI(TAG, "  处理后[%zu]: %d", i, playback_buffer[i]);
+                }
+                first_processed_debug_print = false;
+            }
+            
+            // 播放处理后的音频
+            if (is_playing && speaker_tx_handle) {
+                size_t bytes_written = 0;
+                esp_err_t play_ret = i2s_channel_write(speaker_tx_handle, playback_buffer, 
+                                                      samples_read * sizeof(int16_t), 
+                                                      &bytes_written, 0);
+                
+                if (play_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "播放失败: %s", esp_err_to_name(play_ret));
+                }
+            }
+            
+            // 显示进度和音频统计
+            uint32_t elapsed = (esp_timer_get_time() / 1000) - start_time;
+            if (elapsed % 2000 == 0 && elapsed > 0) {  // 每2秒打印一次
+                // 计算音频电平
+                int32_t sum_squares = 0;
+                int16_t max_sample = 0;
+                int16_t min_sample = 0;
+
+                for (size_t i = 0; i < samples_read; i++) {
+                    int16_t sample = playback_buffer[i];
+                    sum_squares += (int32_t)sample * sample;
+                    if (sample > max_sample) max_sample = sample;
+                    if (sample < min_sample) min_sample = sample;
+                }
+
+                float rms = sqrt((float)sum_squares / samples_read);
+
+                ESP_LOGI(TAG, "录音统计 - 进度: %" PRIu32 "ms | 总样本: %" PRIu32 " | RMS: %.0f | 峰值: %d/%d",
+                         elapsed, total_samples, rms, min_sample, max_sample);
+            }
+        }
+        
+        // 检查录音时长
+        uint32_t current_time = esp_timer_get_time() / 1000;
+        if (current_time - start_time >= RECORD_DURATION_MS) {
+            ESP_LOGI(TAG, "录音完成，总时长: %lu ms", current_time - start_time);
+            break;
+        }
+    }
+    
+    is_recording = false;
+    is_playing = false;
+
+    // 最终统计信息
+    uint32_t total_duration = (esp_timer_get_time() / 1000) - start_time;
+    ESP_LOGI(TAG, "=== 录音任务结束统计 ===");
+    ESP_LOGI(TAG, "总时长: %" PRIu32 " ms", total_duration);
+    ESP_LOGI(TAG, "总样本数: %" PRIu32, total_samples);
+    ESP_LOGI(TAG, "平均采样率: %.1f Hz", (float)total_samples / (total_duration / 1000.0f));
+    ESP_LOGI(TAG, "======================");
+
+    ESP_LOGI(TAG, "I2S录音任务结束");
+    vTaskDelete(NULL);
+}
+
+
+/**
+ * @brief 开始I2S录音和回环播放
+ */
+static void start_i2s_loopback(void)
+{
+    ESP_LOGI(TAG, "开始I2S录音回环测试...");
+
+    is_recording = true;
+    is_playing = true;
+
+    // 创建I2S录音任务
+    xTaskCreate(i2s_record_task, "i2s_record_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "I2S回环测试已启动，录音时长: %d ms", RECORD_DURATION_MS);
+}
+
+/**
+ * @brief 清理I2S资源
+ */
+static void cleanup_i2s(void)
+{
+    if (pdm_rx_handle != NULL) {
+        i2s_channel_disable(pdm_rx_handle);
+        i2s_del_channel(pdm_rx_handle);
+        pdm_rx_handle = NULL;
+    }
+    
+    if (speaker_tx_handle != NULL) {
+        i2s_channel_disable(speaker_tx_handle);
+        i2s_del_channel(speaker_tx_handle);
+        speaker_tx_handle = NULL;
+    }
+    
+    ESP_LOGI(TAG, "I2S资源已清理");
+}
+
+/**
+ * @brief 清理GPIO17控制引脚
+ */
+static void cleanup_control_gpio(void)
+{
+    // 设置GPIO17为低电平
+    gpio_set_level(SPEAKER_MUTE_PIN, 0);
+    ESP_LOGI(TAG, "GPIO17已设置为低电平");
+}
+
+/**
+ * @brief 主函数
+ */
+void app_main(void)
+{
+    ESP_LOGI(TAG, "ESP32-S3 I2S麦克风测试程序启动");
+    ESP_LOGI(TAG, "=== 配置信息 ===");
+    ESP_LOGI(TAG, "采样率: %d Hz", SAMPLE_RATE);
+    ESP_LOGI(TAG, "MIC输入: 32位数据, 喇叭输出: 16位数据");
+    ESP_LOGI(TAG, "缓冲区大小: %d 样本", BUFFER_SIZE);
+    ESP_LOGI(TAG, "录音时长: %d ms", RECORD_DURATION_MS);
+    ESP_LOGI(TAG, "音频处理: 32位->右移8位->除256->16位");
+    ESP_LOGI(TAG, "麦克风引脚 - WS:%d, SCK:%d, DIN:%d", I2S_MIC_WS_PIN, I2S_MIC_SCK_PIN, I2S_MIC_DIN_PIN);
+    ESP_LOGI(TAG, "喇叭引脚 - BCLK:%d, LRCK:%d, DOUT:%d, MUTE:%d",
+             SPEAKER_BCLK_PIN, SPEAKER_LRCK_PIN, SPEAKER_DOUT_PIN, SPEAKER_MUTE_PIN);
+    ESP_LOGI(TAG, "================");
+    
+    // 初始化GPIO17控制引脚
+    ESP_ERROR_CHECK(init_control_gpio());
+    
+    // 初始化I2S麦克风和喇叭
+    ESP_ERROR_CHECK(init_i2s_microphone());
+    ESP_ERROR_CHECK(init_speaker());
+    
+    // 等待系统稳定
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // 等待系统稳定
+    ESP_LOGI(TAG, "等待2秒后开始回环测试...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // 第二步：开始I2S录音回环测试
+    ESP_LOGI(TAG, "=== 第二步：麦克风回环测试 ===");
+    start_i2s_loopback();
+
+    // 等待录音完成
+    vTaskDelay(pdMS_TO_TICKS(RECORD_DURATION_MS + 1000));
+    
+    // 清理资源
+    cleanup_i2s();
+    cleanup_control_gpio();
+    
+    ESP_LOGI(TAG, "I2S测试程序执行完成");
+    ESP_LOGI(TAG, "测试结果说明:");
+    ESP_LOGI(TAG, "1. 如果听到1kHz正弦波，说明喇叭硬件正常");
+    ESP_LOGI(TAG, "2. 如果听到清晰的回环音频，说明I2S麦克风工作正常");
+    ESP_LOGI(TAG, "如果还有噪音或异常，可能需要调整:");
+    ESP_LOGI(TAG, "1. 增益设置 (当前: 1.0)");
+    ESP_LOGI(TAG, "2. I2S时钟配置");
+    ESP_LOGI(TAG, "3. 硬件连接和电源稳定性");
+    
+    // 进入深度睡眠
+    ESP_LOGI(TAG, "进入深度睡眠...");
+    // esp_deep_sleep_start();
+} 

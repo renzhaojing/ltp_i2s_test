@@ -1,0 +1,264 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s.h"
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
+#include "esp_system.h"
+
+// 麦克风 GPIO 配置
+#define AUDIO_I2S_MIC_GPIO_WS       GPIO_NUM_48
+#define AUDIO_I2S_MIC_GPIO_SCK      GPIO_NUM_40
+#define AUDIO_I2S_MIC_GPIO_DIN      GPIO_NUM_39
+#define AUDIO_I2S_MIC_GPIO_SELECT   GPIO_NUM_38 
+
+// 喇叭 GPIO 配置
+#define AUDIO_I2S_SPK_GPIO_DOUT     GPIO_NUM_13
+#define AUDIO_I2S_SPK_GPIO_BCLK     GPIO_NUM_14
+#define AUDIO_I2S_SPK_GPIO_LRCK     GPIO_NUM_21
+#define AUDIO_I2S_SPK_GPIO_MUTE     GPIO_NUM_47
+
+// I2S 配置 - 根据SPH0645LM4H规格调整
+#define SAMPLE_RATE     16000
+#define MCLK_MULTIPLE   256   // MCLK = SAMPLE_RATE * MCLK_MULTIPLE (384是3的倍数，适合24位数据)
+
+// Legacy I2S 配置 - 根据SPH0645LM4H规格调整
+static i2s_config_t i2s_config = {
+    .mode = I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX,
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // SPH0645LM4H实际输出24位，但ESP32只支持16位
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = true,  // 启用APLL以获得更精确的时钟
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = SAMPLE_RATE * MCLK_MULTIPLE  // 设置MCLK
+};
+
+// 音频缓冲区大小
+#define AUDIO_BUFFER_SIZE  2048
+
+// 正弦波频率 (Hz)
+#define SINE_FREQ 1000
+
+
+// 生成正弦波数据（单声道）
+void generate_sine_wave(int16_t *buffer, size_t samples, int sample_rate, int frequency) {
+    for (size_t i = 0; i < samples; i++) {
+        // 生成单声道正弦波，转换为 16-bit PCM
+        float sample = sinf(2 * M_PI * frequency * i / sample_rate);
+        buffer[i] = (int16_t)(sample * 32767.0f);
+    }
+}
+
+// 正弦波测试任务
+void sine_wave_test_task(void *pvParameters) {
+    printf("开始正弦波测试...\n");
+
+    // 创建喇叭 TX channel - 使用默认配置
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    i2s_chan_handle_t tx_handle;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &tx_handle));
+
+    // 配置喇叭标准模式 - 默认配置
+    i2s_std_config_t tx_std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = AUDIO_I2S_SPK_GPIO_BCLK,
+            .ws = AUDIO_I2S_SPK_GPIO_LRCK,
+            .dout = AUDIO_I2S_SPK_GPIO_DOUT,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    tx_std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;  // 右声道
+    tx_std_cfg.slot_cfg.bit_shift = true;
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+
+    // 启用喇叭（设置 MUTE 为高电平）
+    gpio_set_level(AUDIO_I2S_SPK_GPIO_MUTE, 1);
+
+    int16_t *audio_buffer = (int16_t *)malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
+    if (audio_buffer == NULL) {
+        printf("内存分配失败\n");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t bytes_written;
+
+    printf("正弦波测试已启动...\n");
+
+    while (1) {
+        // 生成正弦波（单声道）
+        generate_sine_wave(audio_buffer, AUDIO_BUFFER_SIZE, SAMPLE_RATE, SINE_FREQ);
+
+        // 播放音频
+        ESP_ERROR_CHECK(i2s_channel_write(tx_handle, audio_buffer, AUDIO_BUFFER_SIZE * sizeof(int16_t), &bytes_written, portMAX_DELAY));
+
+        vTaskDelay(pdMS_TO_TICKS(10));  // 短暂延迟
+    }
+
+    free(audio_buffer);
+    ESP_ERROR_CHECK(i2s_channel_disable(tx_handle));
+    ESP_ERROR_CHECK(i2s_del_channel(tx_handle));
+    vTaskDelete(NULL);
+}
+
+// 录音回放测试任务
+void record_playback_test_task(void *pvParameters) {
+    printf("开始录音回放测试...\n");
+    printf("使用 I2S 标准 API...\n");
+
+    // 配置SPH0645LM4H SELECT引脚为左声道（低电平）
+    gpio_config_t select_config = {
+        .pin_bit_mask = (1ULL << AUDIO_I2S_MIC_GPIO_SELECT),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&select_config);
+    gpio_set_level(AUDIO_I2S_MIC_GPIO_SELECT, 0);  // 低电平选择左声道
+    printf("设置麦克风SELECT引脚为左声道\n");
+
+    // 创建麦克风 RX channel - 按照提供的配置
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    chan_cfg.id = (i2s_port_t)1;  // 使用 I2S 端口 1
+    i2s_chan_handle_t rx_handle;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_handle));
+
+    // 配置麦克风标准模式 - 按照提供的配置
+    i2s_std_config_t rx_std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = AUDIO_I2S_MIC_GPIO_SCK,
+            .ws = AUDIO_I2S_MIC_GPIO_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din = AUDIO_I2S_MIC_GPIO_DIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    rx_std_cfg.clk_cfg.sample_rate_hz = SAMPLE_RATE;
+    rx_std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;  // 左声道
+    rx_std_cfg.slot_cfg.bit_shift = true;              // 启用bit shift
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &rx_std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
+    printf("麦克风 RX channel 创建成功\n");
+
+    // 创建喇叭 TX channel - 使用默认配置
+    chan_cfg.id = I2S_NUM_0;  // 使用 I2S 端口 0
+    i2s_chan_handle_t tx_handle;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &tx_handle));
+
+    // 配置喇叭标准模式 - 默认配置
+    i2s_std_config_t tx_std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = AUDIO_I2S_SPK_GPIO_BCLK,
+            .ws = AUDIO_I2S_SPK_GPIO_LRCK,
+            .dout = AUDIO_I2S_SPK_GPIO_DOUT,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    tx_std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_RIGHT;  // 右声道
+    tx_std_cfg.slot_cfg.bit_shift = true;
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+    printf("喇叭 TX channel 创建成功\n");
+
+    // 启用喇叭
+    gpio_set_level(AUDIO_I2S_SPK_GPIO_MUTE, 1);
+
+    // 为16位数据分配缓冲区
+    const int32_t samples_per_read = AUDIO_BUFFER_SIZE / 2;  // 单声道读取
+    int16_t *mic_buffer = (int16_t *)malloc(samples_per_read * sizeof(int16_t));
+    int16_t *audio_buffer = (int16_t *)malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
+
+    if (mic_buffer == NULL || audio_buffer == NULL) {
+        printf("内存分配失败\n");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t bytes_read, bytes_written;
+
+    printf("录音回放测试已启动...\n");
+    printf("麦克风配置: 16位采样, 左声道\n");
+
+    while (1) {
+        // 从麦克风录音 (16位数据) - 标准API
+        ESP_ERROR_CHECK(i2s_channel_read(rx_handle, mic_buffer, samples_per_read * sizeof(int16_t), &bytes_read, portMAX_DELAY));
+
+        int samples = bytes_read / sizeof(int16_t);
+
+        // 转换为双通道16位数据
+        for (int i = 0; i < samples; i++) {
+            // 16位数据直接使用（来自SPH0645LM4H的高16位）
+            int16_t mic_sample = mic_buffer[i];
+
+            // 双通道输出：左通道=麦克风，右通道=0（简化版，无AEC）
+            audio_buffer[i * 2] = mic_sample;     // 左通道：麦克风数据
+            audio_buffer[i * 2 + 1] = 0;          // 右通道：设为0
+        }
+
+        // 通过喇叭回放录音数据 - 标准API
+        ESP_ERROR_CHECK(i2s_channel_write(tx_handle, audio_buffer, samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY));
+    }
+
+    free(mic_buffer);
+    free(audio_buffer);
+    ESP_ERROR_CHECK(i2s_channel_disable(rx_handle));
+    ESP_ERROR_CHECK(i2s_channel_disable(tx_handle));
+    ESP_ERROR_CHECK(i2s_del_channel(rx_handle));
+    ESP_ERROR_CHECK(i2s_del_channel(tx_handle));
+    vTaskDelete(NULL);
+}
+
+// 主函数
+void app_main(void) {
+    printf("ESP32-S3 I2S 测试程序启动\n");
+
+    // 配置 MUTE 引脚为输出
+    gpio_config_t mute_config = {
+        .pin_bit_mask = (1ULL << AUDIO_I2S_SPK_GPIO_MUTE),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&mute_config);
+
+    // 默认关闭喇叭
+    gpio_set_level(AUDIO_I2S_SPK_GPIO_MUTE, 0);
+
+    // printf("开始正弦波测试...\n");
+    // xTaskCreate(sine_wave_test_task, "sine_wave_test", 4096, NULL, 5, NULL);
+
+    printf("开始录音回放测试...\n");
+    xTaskCreate(record_playback_test_task, "record_playback_test", 4096, NULL, 5, NULL);
+}
