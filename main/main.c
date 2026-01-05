@@ -500,6 +500,7 @@ static void led_control_task(void *arg)
     AUDIO_LOGI(TAG, "LED控制任务启动");
     
     uint32_t last_update_time = 0;
+    float smoothed_led_count = 0.0f;  // 平滑后的LED数量（浮点数，用于平滑过渡）
     
     while (is_recording) {
         uint32_t current_time = esp_timer_get_time() / 1000;
@@ -517,10 +518,10 @@ static void led_control_task(void *arg)
                 xSemaphoreGive(audio_data_mutex);
             }
             
-            // 根据峰峰值计算要亮的LED数量
+            // 根据峰峰值计算目标LED数量
             // 调高阈值，降低低音量时的灵敏度
             // 例如：11-25的峰峰值范围就能实现1-16个LED全亮
-            int led_count = 0;
+            float target_led_count = 0.0f;
             const int PEAK_MIN = 11;   // 最小峰峰值阈值（触发LED，峰峰值<=10时亮0个LED）
             const int PEAK_MAX = 25;   // 最大峰峰值（调高阈值，降低低音量灵敏度）
             
@@ -534,11 +535,21 @@ static void led_control_task(void *arg)
                 normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
                 // 进一步放大低音量响应：使用平方函数增强低音量段的响应
                 normalized = normalized * normalized;  // 平方，让低音量响应更明显
-                led_count = (int)(normalized * LED_STRIP_NUM) + 1;  // 至少亮1个LED
-                if (led_count > LED_STRIP_NUM) led_count = LED_STRIP_NUM;
+                target_led_count = normalized * LED_STRIP_NUM + 1.0f;  // 至少亮1个LED
+                if (target_led_count > LED_STRIP_NUM) target_led_count = LED_STRIP_NUM;
             } else {
-                led_count = 0;  // 静音时不亮LED（峰峰值<=10）
+                target_led_count = 0.0f;  // 静音时不亮LED（峰峰值<=10）
             }
+            
+            // 使用指数平滑算法，让LED数量变化更平滑，减少闪烁
+            // 平滑系数：0.4表示新值权重40%，旧值权重60%，值越小越平滑但响应越慢
+            const float SMOOTH_FACTOR = 0.8f;  // 平滑系数（0.0-1.0），0.4在响应速度和平滑度之间平衡
+            smoothed_led_count = smoothed_led_count * (1.0f - SMOOTH_FACTOR) + target_led_count * SMOOTH_FACTOR;
+            
+            // 转换为整数LED数量
+            int led_count = (int)(smoothed_led_count + 0.5f);  // 四舍五入
+            if (led_count < 0) led_count = 0;
+            if (led_count > LED_STRIP_NUM) led_count = LED_STRIP_NUM;
             
             if (led_strip != NULL) {
                 // 清除所有LED
