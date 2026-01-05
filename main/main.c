@@ -20,7 +20,7 @@
 static const char *TAG = "ADC_MIC_TEST";
 
 // 日志开关：设置为1启用日志，0禁用日志（提高性能，减少串口输出）
-#define ENABLE_AUDIO_LOG  0
+#define ENABLE_AUDIO_LOG  1
 
 // 日志宏定义：根据开关决定是否输出日志
 #if ENABLE_AUDIO_LOG
@@ -51,7 +51,7 @@ static const char *TAG = "ADC_MIC_TEST";
 
 // WS2812 LED灯带配置
 #define LED_STRIP_PIN          GPIO_NUM_7   // WS2812数据引脚（可根据实际硬件修改）
-#define LED_STRIP_NUM          16           // LED数量
+#define LED_STRIP_NUM          50           // LED数量
 #define LED_UPDATE_INTERVAL_MS 50           // LED更新间隔（50ms），更快响应
 
 // GPIO到ADC通道映射表（ESP32-C3）
