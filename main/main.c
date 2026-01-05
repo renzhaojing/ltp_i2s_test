@@ -53,7 +53,7 @@ static const char *TAG = "ADC_MIC_TEST";
 #define SAMPLE_RATE            8000    // 目标采样率8kHz（软件定时器实际约500-1000Hz）
 #define BITS_PER_SAMPLE        12      // ADC为12位
 #define BUFFER_SIZE            50      // 读取缓冲区大小（样本数）- 约6.25ms数据，极快响应
-#define RECORD_DURATION_MS     60000   // 20秒录音
+#define RECORD_DURATION_MS     120000   // 20秒录音
 #define ADC_SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE)  // 采样间隔（微秒）
 #define AUDIO_UPDATE_INTERVAL_MS 50   // 音频统计更新间隔（50ms），更快响应
 #define LED_UPDATE_INTERVAL_MS 50     // LED更新间隔（50ms），更快响应
@@ -477,7 +477,6 @@ static void led_control_task(void *arg)
 {
     ESP_LOGI(TAG, "LED控制任务启动");
     
-    uint32_t flow_position = 0;  // 流水位置
     uint32_t last_update_time = 0;
     
     while (is_recording) {
@@ -513,15 +512,6 @@ static void led_control_task(void *arg)
                 led_count = 0;  // 静音时不亮LED
             }
             
-            // 流水效果：根据音量强度移动起始位置
-            // 音量越大，流水速度越快（1-10步/100ms）
-            int flow_speed = 1;  // 默认速度
-            if (volume_percent > 0) {
-                flow_speed = (int)(volume_percent / 10.0f) + 1;  // 1-11的速度
-                if (flow_speed > 10) flow_speed = 10;  // 最大速度限制
-            }
-            flow_position = (flow_position + flow_speed) % (LED_STRIP_NUM * 2);
-            
             if (led_strip != NULL) {
                 // 清除所有LED
                 ws2812_clear(led_strip);
@@ -547,24 +537,22 @@ static void led_control_task(void *arg)
                     }
                 }
                 
-                // 流水效果：从flow_position开始点亮led_count个LED
-                // 实现流水效果：LED从一端流向另一端
+                // 从第1个LED（索引0）开始顺序点亮led_count个LED
+                // 根据声音强弱，依次点亮更多LED
                 for (int i = 0; i < led_count; i++) {
-                    // 计算LED位置（流水方向：从0到LED_STRIP_NUM-1）
-                    int pos = (flow_position / 2 + i) % LED_STRIP_NUM;
-                    
                     // 渐变效果：前面的LED最亮，后面的逐渐变暗
                     float brightness = 1.0f;
                     if (led_count > 1) {
-                        brightness = 1.0f - ((float)i / (float)led_count) * 0.7f;  // 亮度从1.0到0.3
+                        brightness = 1.0f - ((float)i / (float)led_count) * 0.5f;  // 亮度从1.0到0.5
                     }
-                    if (brightness < 0.3f) brightness = 0.3f;  // 最小亮度
+                    if (brightness < 0.5f) brightness = 0.5f;  // 最小亮度
                     
                     uint8_t led_r = (uint8_t)(r * brightness);
                     uint8_t led_g = (uint8_t)(g * brightness);
                     uint8_t led_b = (uint8_t)(b * brightness);
                     
-                    ws2812_set_pixel(led_strip, pos, led_r, led_g, led_b);
+                    // 从LED 0开始顺序点亮
+                    ws2812_set_pixel(led_strip, i, led_r, led_g, led_b);
                 }
                 
                 // 刷新LED显示
