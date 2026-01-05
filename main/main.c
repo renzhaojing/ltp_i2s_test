@@ -19,6 +19,22 @@
 
 static const char *TAG = "ADC_MIC_TEST";
 
+// 日志开关：设置为1启用日志，0禁用日志（提高性能，减少串口输出）
+#define ENABLE_AUDIO_LOG  0
+
+// 日志宏定义：根据开关决定是否输出日志
+#if ENABLE_AUDIO_LOG
+#define AUDIO_LOGI(tag, format, ...) ESP_LOGI(tag, format, ##__VA_ARGS__)
+#define AUDIO_LOGE(tag, format, ...) ESP_LOGE(tag, format, ##__VA_ARGS__)
+#define AUDIO_LOGW(tag, format, ...) ESP_LOGW(tag, format, ##__VA_ARGS__)
+#define AUDIO_LOGD(tag, format, ...) ESP_LOGD(tag, format, ##__VA_ARGS__)
+#else
+#define AUDIO_LOGI(tag, format, ...) ((void)0)
+#define AUDIO_LOGE(tag, format, ...) ((void)0)
+#define AUDIO_LOGW(tag, format, ...) ((void)0)
+#define AUDIO_LOGD(tag, format, ...) ((void)0)
+#endif
+
 /*
  * ESP32-C3 模拟麦克风（ADC）配置说明：
  * - 使用ADC直接读取模拟麦克风数据
@@ -93,13 +109,13 @@ static esp_err_t init_led_strip(void);
  */
 static esp_err_t init_adc_microphone(void)
 {
-    ESP_LOGI(TAG, "初始化ADC模拟麦克风 (ESP32-C3)...");
-    ESP_LOGI(TAG, "ADC输入引脚: GPIO%d (ADC_CHANNEL_%d)", ADC_MIC_PIN, ADC_MIC_CHANNEL);
-    ESP_LOGI(TAG, "硬件检查建议:");
-    ESP_LOGI(TAG, "  1. 确认模拟麦克风电源为3.3V (VDD)");
-    ESP_LOGI(TAG, "  2. 确认GND连接正确");
-    ESP_LOGI(TAG, "  3. 确认ADC输入引脚连接正确 (GPIO%d)", ADC_MIC_PIN);
-    ESP_LOGI(TAG, "  4. 建议在ADC输入引脚添加0.1uF对地滤波电容");
+    AUDIO_LOGI(TAG, "初始化ADC模拟麦克风 (ESP32-C3)...");
+    AUDIO_LOGI(TAG, "ADC输入引脚: GPIO%d (ADC_CHANNEL_%d)", ADC_MIC_PIN, ADC_MIC_CHANNEL);
+    AUDIO_LOGI(TAG, "硬件检查建议:");
+    AUDIO_LOGI(TAG, "  1. 确认模拟麦克风电源为3.3V (VDD)");
+    AUDIO_LOGI(TAG, "  2. 确认GND连接正确");
+    AUDIO_LOGI(TAG, "  3. 确认ADC输入引脚连接正确 (GPIO%d)", ADC_MIC_PIN);
+    AUDIO_LOGI(TAG, "  4. 建议在ADC输入引脚添加0.1uF对地滤波电容");
 
     // 配置ADC1单元（使用新的ADC API）
     adc_oneshot_unit_init_cfg_t init_config = {
@@ -107,7 +123,7 @@ static esp_err_t init_adc_microphone(void)
     };
     esp_err_t err = adc_oneshot_new_unit(&init_config, &adc1_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "创建ADC1单元失败: %s", esp_err_to_name(err));
+        AUDIO_LOGE(TAG, "创建ADC1单元失败: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -118,7 +134,7 @@ static esp_err_t init_adc_microphone(void)
     };
     err = adc_oneshot_config_channel(adc1_handle, ADC_MIC_CHANNEL, &config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "配置ADC通道失败: %s", esp_err_to_name(err));
+        AUDIO_LOGE(TAG, "配置ADC通道失败: %s", esp_err_to_name(err));
         adc_oneshot_del_unit(adc1_handle);
         adc1_handle = NULL;
         return err;
@@ -133,15 +149,15 @@ static esp_err_t init_adc_microphone(void)
     err = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle);
     if (err == ESP_OK) {
         adc_calibration_init = true;
-        ESP_LOGI(TAG, "ADC校准: 使用曲线拟合方案");
+        AUDIO_LOGI(TAG, "ADC校准: 使用曲线拟合方案");
     } else {
-        ESP_LOGW(TAG, "ADC校准初始化失败: %s，将使用原始ADC值", esp_err_to_name(err));
+        AUDIO_LOGW(TAG, "ADC校准初始化失败: %s，将使用原始ADC值", esp_err_to_name(err));
         adc_calibration_init = false;
     }
 
-    ESP_LOGI(TAG, "ADC模拟麦克风初始化成功");
-    ESP_LOGI(TAG, "配置: 12位ADC, 12dB衰减, 采样率: %d Hz", SAMPLE_RATE);
-    ESP_LOGI(TAG, "有效测量范围: 0 ~ 2500 mV");
+    AUDIO_LOGI(TAG, "ADC模拟麦克风初始化成功");
+    AUDIO_LOGI(TAG, "配置: 12位ADC, 12dB衰减, 采样率: %d Hz", SAMPLE_RATE);
+    AUDIO_LOGI(TAG, "有效测量范围: 0 ~ 2500 mV");
     
     return ESP_OK;
 }
@@ -155,14 +171,14 @@ static void mic_test_task(void *arg)
     // 注意：如果任务已经在看门狗监控中，这个调用会被忽略
     esp_task_wdt_add(NULL);
     
-    ESP_LOGI(TAG, "ADC模拟麦克风测试任务启动");
+    AUDIO_LOGI(TAG, "ADC模拟麦克风测试任务启动");
 
     uint32_t total_samples = 0;
     uint32_t start_time = esp_timer_get_time() / 1000;
     int64_t last_sample_time = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "开始读取ADC模拟麦克风数据...");
-    ESP_LOGI(TAG, "采样间隔: %d 微秒 (目标采样率: %d Hz)", ADC_SAMPLE_INTERVAL_US, SAMPLE_RATE);
+    AUDIO_LOGI(TAG, "开始读取ADC模拟麦克风数据...");
+    AUDIO_LOGI(TAG, "采样间隔: %d 微秒 (目标采样率: %d Hz)", ADC_SAMPLE_INTERVAL_US, SAMPLE_RATE);
 
     size_t buffer_idx = 0;
 
@@ -195,7 +211,7 @@ static void mic_test_task(void *arg)
         int adc_raw = 0;
         esp_err_t ret = adc_oneshot_read(adc1_handle, ADC_MIC_CHANNEL, &adc_raw);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "读取ADC失败: %s", esp_err_to_name(ret));
+            AUDIO_LOGE(TAG, "读取ADC失败: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -265,14 +281,14 @@ static void mic_test_task(void *arg)
             // 总是更新音频数据到共享结构体（用于LED控制，实时响应）
             int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
             float volume_percent = 0.0f;
-            const int PEAK_LOW = 5;    // 进一步降低阈值，提高灵敏度（正常说话也能检测）
-            const int PEAK_HIGH = 50;  // 进一步降低高音量阈值，让正常说话就能达到高百分比
+            const int PEAK_LOW = 5;    // 进一步降低阈值，提高灵敏度（正常说话也能检测，峰峰值<=4时静音）
+            const int PEAK_HIGH = 15;  // 进一步降低高音量阈值，让远距离也能达到高百分比
             if (peak_to_peak > PEAK_LOW) {
                 // 使用更激进的映射，增强低音量响应
                 float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
                 if (normalized > 1.0f) normalized = 1.0f;  // 限制在0-1范围
-                normalized = sqrtf(normalized);  // 平方根映射
-                normalized = normalized * normalized;  // 平方，让低音量响应更明显
+                normalized = sqrtf(normalized);  // 平方根映射，让低音量响应更明显
+                normalized = normalized * normalized;  // 平方，进一步放大低音量响应
                 volume_percent = normalized * 100.0f;
                 if (volume_percent > 100.0f) volume_percent = 100.0f;
             }
@@ -297,15 +313,15 @@ static void mic_test_task(void *arg)
                 // 计算平均ADC原始值（反映声音的平均电平）
                 float avg_adc_raw = avg_voltage * 4095.0f / 2500.0f;
                 
-                ESP_LOGI(TAG, "进度: %" PRIu32 " ms | 样本: %" PRIu32 " | RMS: %.1f | 峰值: %d/%d (峰峰值: %d)", 
+                AUDIO_LOGI(TAG, "进度: %" PRIu32 " ms | 样本: %" PRIu32 " | RMS: %.1f | 峰值: %d/%d (峰峰值: %d)", 
                          elapsed, total_samples, rms, min_sample, max_sample, peak_to_peak);
-                ESP_LOGI(TAG, "  音量指标: RMS=%.1f | 平均绝对值=%.1f | 平均ADC=%.1f | 平均电压=%.1f mV", 
+                AUDIO_LOGI(TAG, "  音量指标: RMS=%.1f | 平均绝对值=%.1f | 平均ADC=%.1f | 平均电压=%.1f mV", 
                          rms, avg_abs, avg_adc_raw, avg_voltage);
-                ESP_LOGI(TAG, "  ADC原始值范围: %d-%d (12位, 0-4095) | 电压范围: %.1f-%.1f mV", 
+                AUDIO_LOGI(TAG, "  ADC原始值范围: %d-%d (12位, 0-4095) | 电压范围: %.1f-%.1f mV", 
                          adc_raw_range_min, adc_raw_range_max,
                          (float)adc_raw_range_min * 2500.0f / 4095.0f,
                          (float)adc_raw_range_max * 2500.0f / 4095.0f);
-                ESP_LOGI(TAG, "  历史ADC范围: %d-%d (总范围: %d)", 
+                AUDIO_LOGI(TAG, "  历史ADC范围: %d-%d (总范围: %d)", 
                          adc_raw_min, adc_raw_max, adc_raw_max - adc_raw_min);
                 
                 // 声音大小判断（使用动态阈值和相对值）
@@ -318,13 +334,13 @@ static void mic_test_task(void *arg)
                 if (!baseline_set && peak_to_peak < 20) {
                     baseline_rms = rms;
                     baseline_set = true;
-                    ESP_LOGI(TAG, "  📊 设置静音基线: RMS=%.1f", baseline_rms);
+                    AUDIO_LOGI(TAG, "  📊 设置静音基线: RMS=%.1f", baseline_rms);
                 }
                 
                 // 使用峰峰值作为主要音量指标（更敏感）
                 const int PEAK_LOW = 5;     // 峰峰值阈值：低音量（进一步降低，正常说话也能检测）
-                const int PEAK_MID = 25;    // 峰峰值阈值：中音量（进一步降低）
-                const int PEAK_HIGH = 50;   // 峰峰值阈值：高音量（进一步降低，让正常说话就能达到高音量）
+                const int PEAK_MID = 10;    // 峰峰值阈值：中音量（进一步降低，让远距离也能达到中音量）
+                const int PEAK_HIGH = 15;   // 峰峰值阈值：高音量（进一步降低，让远距离也能达到高音量）
                 
                 // RMS相对变化（相对于基线）
                 float rms_change = 0.0f;
@@ -344,41 +360,41 @@ static void mic_test_task(void *arg)
                     volume_level = "高";
                 }
                 
-                ESP_LOGI(TAG, "  🔊 音量等级: %s | 峰峰值=%d | RMS=%.1f (变化=%.1f) | 平均绝对值=%.1f", 
+                AUDIO_LOGI(TAG, "  🔊 音量等级: %s | 峰峰值=%d | RMS=%.1f (变化=%.1f) | 平均绝对值=%.1f", 
                          volume_level, peak_to_peak, rms, rms_change, avg_abs);
                 
                 // 音量强度百分比（基于峰峰值，归一化到0-100%）
                 // 注意：这里的volume_percent仅用于日志显示，LED控制使用的是上面计算的volume_percent
                 float volume_percent_log = 0.0f;
                 const int PEAK_LOW_LOG = 5;
-                const int PEAK_HIGH_LOG = 50;  // 与LED控制保持一致
+                const int PEAK_HIGH_LOG = 15;  // 与LED控制保持一致
                 if (peak_to_peak > PEAK_LOW_LOG) {
                     float normalized = ((float)(peak_to_peak - PEAK_LOW_LOG) / (PEAK_HIGH_LOG - PEAK_LOW_LOG));
                     if (normalized > 1.0f) normalized = 1.0f;
-                    normalized = sqrtf(normalized);  // 平方根映射
-                    normalized = normalized * normalized;  // 平方，增强低音量响应
+                    normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
+                    normalized = normalized * normalized;  // 平方，进一步放大低音量响应
                     volume_percent_log = normalized * 100.0f;
                     if (volume_percent_log > 100.0f) volume_percent_log = 100.0f;
                 }
-                ESP_LOGI(TAG, "  📈 音量强度: %.1f%% (基于峰峰值)", volume_percent_log);
+                AUDIO_LOGI(TAG, "  📈 音量强度: %.1f%% (基于峰峰值)", volume_percent_log);
                 last_print_time = elapsed;
                 
                 // 判断数据变化情况
                 if (peak_to_peak < 10) {
-                    ESP_LOGW(TAG, "⚠ 数据变化很小（峰峰值: %d），可能是静音或硬件连接问题", peak_to_peak);
+                    AUDIO_LOGW(TAG, "⚠ 数据变化很小（峰峰值: %d），可能是静音或硬件连接问题", peak_to_peak);
                 } else if (peak_to_peak > 100) {
-                    ESP_LOGI(TAG, "✓ 检测到明显的声音信号（峰峰值: %d）", peak_to_peak);
+                    AUDIO_LOGI(TAG, "✓ 检测到明显的声音信号（峰峰值: %d）", peak_to_peak);
                 }
             }
 
             // 打印前16个样本（每500ms打印一次，减少日志输出）
             if (elapsed % 500 == 0) {
-                ESP_LOGI(TAG, "ADC数据样本 (前16个，12位ADC转换为16位):");
+                AUDIO_LOGI(TAG, "ADC数据样本 (前16个，12位ADC转换为16位):");
                 for (size_t i = 0; i < 16 && i < BUFFER_SIZE; i++) {
                     int16_t sample = mic_buffer[i];
                     int adc_raw_val = sample + 2048;  // 转换回原始ADC值
                     uint32_t voltage = (adc_raw_val * 2500) / 4095;  // 估算电压
-                    ESP_LOGI(TAG, "  [%zu]: ADC=%d (0x%03X) -> 16bit=%d (0x%04X) -> ~%" PRIu32 "mV", 
+                    AUDIO_LOGI(TAG, "  [%zu]: ADC=%d (0x%03X) -> 16bit=%d (0x%04X) -> ~%" PRIu32 "mV", 
                              i, adc_raw_val, adc_raw_val, sample, (uint16_t)sample, (uint32_t)voltage);
                 }
             }
@@ -393,7 +409,7 @@ static void mic_test_task(void *arg)
         // 检查录音时长
         uint32_t current_time_ms = esp_timer_get_time() / 1000;
         if (current_time_ms - start_time >= RECORD_DURATION_MS) {
-            ESP_LOGI(TAG, "ADC模拟麦克风测试完成，总时长: %" PRIu32 " ms", current_time_ms - start_time);
+            AUDIO_LOGI(TAG, "ADC模拟麦克风测试完成，总时长: %" PRIu32 " ms", current_time_ms - start_time);
             break;
         }
     }
@@ -403,13 +419,13 @@ static void mic_test_task(void *arg)
     // 最终统计信息
     uint32_t total_duration = (esp_timer_get_time() / 1000) - start_time;
     float actual_sample_rate = (float)total_samples / (total_duration / 1000.0f);
-    ESP_LOGI(TAG, "=== ADC模拟麦克风测试结束统计 ===");
-    ESP_LOGI(TAG, "总时长: %" PRIu32 " ms", total_duration);
-    ESP_LOGI(TAG, "总样本数: %" PRIu32, total_samples);
-    ESP_LOGI(TAG, "实际采样率: %.1f Hz (目标: %d Hz)", actual_sample_rate, SAMPLE_RATE);
-    ESP_LOGI(TAG, "==========================");
+    AUDIO_LOGI(TAG, "=== ADC模拟麦克风测试结束统计 ===");
+    AUDIO_LOGI(TAG, "总时长: %" PRIu32 " ms", total_duration);
+    AUDIO_LOGI(TAG, "总样本数: %" PRIu32, total_samples);
+    AUDIO_LOGI(TAG, "实际采样率: %.1f Hz (目标: %d Hz)", actual_sample_rate, SAMPLE_RATE);
+    AUDIO_LOGI(TAG, "==========================");
 
-    ESP_LOGI(TAG, "ADC模拟麦克风测试任务结束");
+    AUDIO_LOGI(TAG, "ADC模拟麦克风测试任务结束");
     
     // 从看门狗监控中移除任务
     esp_task_wdt_delete(NULL);
@@ -422,7 +438,7 @@ static void mic_test_task(void *arg)
  */
 static void start_mic_test(void)
 {
-    ESP_LOGI(TAG, "开始ADC模拟麦克风测试...");
+    AUDIO_LOGI(TAG, "开始ADC模拟麦克风测试...");
 
     is_recording = true;
 
@@ -430,7 +446,7 @@ static void start_mic_test(void)
     if (audio_data_mutex == NULL) {
         audio_data_mutex = xSemaphoreCreateMutex();
         if (audio_data_mutex == NULL) {
-            ESP_LOGE(TAG, "创建音频数据互斥锁失败");
+            AUDIO_LOGE(TAG, "创建音频数据互斥锁失败");
             return;
         }
     }
@@ -441,8 +457,8 @@ static void start_mic_test(void)
     // 创建LED控制任务
     xTaskCreate(led_control_task, "led_control_task", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "ADC模拟麦克风测试已启动，测试时长: %d ms", RECORD_DURATION_MS);
-    ESP_LOGI(TAG, "LED灯带控制已启动，更新间隔: %d ms", LED_UPDATE_INTERVAL_MS);
+    AUDIO_LOGI(TAG, "ADC模拟麦克风测试已启动，测试时长: %d ms", RECORD_DURATION_MS);
+    AUDIO_LOGI(TAG, "LED灯带控制已启动，更新间隔: %d ms", LED_UPDATE_INTERVAL_MS);
 }
 
 /**
@@ -450,29 +466,29 @@ static void start_mic_test(void)
  */
 static esp_err_t init_led_strip(void)
 {
-    ESP_LOGI(TAG, "初始化WS2812 LED灯带...");
-    ESP_LOGI(TAG, "LED引脚: GPIO%d, LED数量: %d", LED_STRIP_PIN, LED_STRIP_NUM);
+    AUDIO_LOGI(TAG, "初始化WS2812 LED灯带...");
+    AUDIO_LOGI(TAG, "LED引脚: GPIO%d, LED数量: %d", LED_STRIP_PIN, LED_STRIP_NUM);
     
     esp_err_t ret = ws2812_init(LED_STRIP_PIN, LED_STRIP_NUM, &led_strip);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "初始化WS2812失败: %s", esp_err_to_name(ret));
+        AUDIO_LOGE(TAG, "初始化WS2812失败: %s", esp_err_to_name(ret));
         return ret;
     }
     
     // 清除LED
     ret = ws2812_clear(led_strip);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "清除LED失败: %s", esp_err_to_name(ret));
+        AUDIO_LOGE(TAG, "清除LED失败: %s", esp_err_to_name(ret));
         return ret;
     }
     
     ret = ws2812_refresh(led_strip);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "刷新LED失败: %s", esp_err_to_name(ret));
+        AUDIO_LOGE(TAG, "刷新LED失败: %s", esp_err_to_name(ret));
         return ret;
     }
     
-    ESP_LOGI(TAG, "WS2812 LED灯带初始化成功");
+    AUDIO_LOGI(TAG, "WS2812 LED灯带初始化成功");
     return ESP_OK;
 }
 
@@ -481,7 +497,7 @@ static esp_err_t init_led_strip(void)
  */
 static void led_control_task(void *arg)
 {
-    ESP_LOGI(TAG, "LED控制任务启动");
+    AUDIO_LOGI(TAG, "LED控制任务启动");
     
     uint32_t last_update_time = 0;
     
@@ -503,24 +519,26 @@ static void led_control_task(void *arg)
             
             // 根据峰峰值计算要亮的LED数量
             // 进一步降低阈值范围，让更低的声音段也能看到明显效果
-            // 例如：5-50的峰峰值范围就能实现1-16个LED全亮（更激进的映射）
+            // 例如：5-15的峰峰值范围就能实现1-16个LED全亮（更激进的映射）
+            // 这样即使距离较远，也能达到和近距离一样灵敏的效果
             int led_count = 0;
-            const int PEAK_MIN = 5;    // 最小峰峰值阈值（触发LED）
-            const int PEAK_MAX = 50;   // 最大峰峰值（进一步降低，让正常说话就能触发全亮）
+            const int PEAK_MIN = 5;    // 最小峰峰值阈值（触发LED，峰峰值<=4时亮0个LED）
+            const int PEAK_MAX = 15;   // 最大峰峰值（进一步降低，让远距离也能触发全亮）
             
             if (peak_to_peak > PEAK_MIN) {
-                // 使用更激进的映射：先平方根，再平方，增强低音量响应
+                // 使用更激进的映射：使用平方根映射，让低音量响应更明显
                 // 这样更小的声音变化也能产生更大的LED数量变化
                 float normalized = ((float)(peak_to_peak - PEAK_MIN) / (PEAK_MAX - PEAK_MIN));
                 if (normalized > 1.0f) normalized = 1.0f;  // 限制在0-1范围
                 // 使用平方根映射，让低音量范围有更大的响应
-                normalized = sqrtf(normalized);
-                // 进一步放大低音量响应：使用平方函数
+                // 不使用三次方，改用更简单的平方根，让响应更明显
+                normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
+                // 进一步放大低音量响应：使用平方函数增强低音量段的响应
                 normalized = normalized * normalized;  // 平方，让低音量响应更明显
                 led_count = (int)(normalized * LED_STRIP_NUM) + 1;  // 至少亮1个LED
                 if (led_count > LED_STRIP_NUM) led_count = LED_STRIP_NUM;
             } else {
-                led_count = 0;  // 静音时不亮LED
+                led_count = 0;  // 静音时不亮LED（峰峰值<=4）
             }
             
             if (led_strip != NULL) {
@@ -584,7 +602,7 @@ static void led_control_task(void *arg)
         led_strip = NULL;
     }
     
-    ESP_LOGI(TAG, "LED控制任务结束");
+    AUDIO_LOGI(TAG, "LED控制任务结束");
     vTaskDelete(NULL);
 }
 
@@ -601,7 +619,7 @@ static void cleanup_adc(void)
         adc_oneshot_del_unit(adc1_handle);
         adc1_handle = NULL;
     }
-    ESP_LOGI(TAG, "ADC资源已清理");
+    AUDIO_LOGI(TAG, "ADC资源已清理");
 }
 
 /**
@@ -609,45 +627,45 @@ static void cleanup_adc(void)
  */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-C3 ADC模拟麦克风测试程序启动");
-    ESP_LOGI(TAG, "=== ESP32-C3 ADC模拟麦克风测试配置 ===");
-    ESP_LOGI(TAG, "采样率: %d Hz, ADC位深: %d bit", SAMPLE_RATE, BITS_PER_SAMPLE);
-    ESP_LOGI(TAG, "缓冲区大小: %d 样本", BUFFER_SIZE);
-    ESP_LOGI(TAG, "测试时长: %d ms", RECORD_DURATION_MS);
-    ESP_LOGI(TAG, "开发板: ESP32-C3 (RISC-V架构)");
-    ESP_LOGI(TAG, "麦克风类型: 模拟麦克风（ADC输入）");
-    ESP_LOGI(TAG, "ADC配置:");
-    ESP_LOGI(TAG, "  ADC输入引脚: GPIO%d (ADC_CHANNEL_%d)", ADC_MIC_PIN, ADC_MIC_CHANNEL);
-    ESP_LOGI(TAG, "  衰减: 12dB (有效范围: 0-2500mV)");
-    ESP_LOGI(TAG, "  分辨率: 12位");
-    ESP_LOGI(TAG, "  采样率: %d Hz", SAMPLE_RATE);
-    ESP_LOGI(TAG, "LED配置:");
-    ESP_LOGI(TAG, "  LED引脚: GPIO%d", LED_STRIP_PIN);
-    ESP_LOGI(TAG, "  LED数量: %d", LED_STRIP_NUM);
-    ESP_LOGI(TAG, "  LED更新间隔: %d ms", LED_UPDATE_INTERVAL_MS);
-    ESP_LOGI(TAG, "  音频更新间隔: %d ms", AUDIO_UPDATE_INTERVAL_MS);
-    ESP_LOGI(TAG, "===================================");
+    AUDIO_LOGI(TAG, "ESP32-C3 ADC模拟麦克风测试程序启动");
+    AUDIO_LOGI(TAG, "=== ESP32-C3 ADC模拟麦克风测试配置 ===");
+    AUDIO_LOGI(TAG, "采样率: %d Hz, ADC位深: %d bit", SAMPLE_RATE, BITS_PER_SAMPLE);
+    AUDIO_LOGI(TAG, "缓冲区大小: %d 样本", BUFFER_SIZE);
+    AUDIO_LOGI(TAG, "测试时长: %d ms", RECORD_DURATION_MS);
+    AUDIO_LOGI(TAG, "开发板: ESP32-C3 (RISC-V架构)");
+    AUDIO_LOGI(TAG, "麦克风类型: 模拟麦克风（ADC输入）");
+    AUDIO_LOGI(TAG, "ADC配置:");
+    AUDIO_LOGI(TAG, "  ADC输入引脚: GPIO%d (ADC_CHANNEL_%d)", ADC_MIC_PIN, ADC_MIC_CHANNEL);
+    AUDIO_LOGI(TAG, "  衰减: 12dB (有效范围: 0-2500mV)");
+    AUDIO_LOGI(TAG, "  分辨率: 12位");
+    AUDIO_LOGI(TAG, "  采样率: %d Hz", SAMPLE_RATE);
+    AUDIO_LOGI(TAG, "LED配置:");
+    AUDIO_LOGI(TAG, "  LED引脚: GPIO%d", LED_STRIP_PIN);
+    AUDIO_LOGI(TAG, "  LED数量: %d", LED_STRIP_NUM);
+    AUDIO_LOGI(TAG, "  LED更新间隔: %d ms", LED_UPDATE_INTERVAL_MS);
+    AUDIO_LOGI(TAG, "  音频更新间隔: %d ms", AUDIO_UPDATE_INTERVAL_MS);
+    AUDIO_LOGI(TAG, "===================================");
 
     // 初始化WS2812 LED灯带
-    ESP_LOGI(TAG, "=== 初始化WS2812 LED灯带 ===");
+    AUDIO_LOGI(TAG, "=== 初始化WS2812 LED灯带 ===");
     esp_err_t led_init_err = init_led_strip();
     if (led_init_err != ESP_OK) {
-        ESP_LOGW(TAG, "LED灯带初始化失败: %s，将继续运行但不显示LED效果", esp_err_to_name(led_init_err));
+        AUDIO_LOGW(TAG, "LED灯带初始化失败: %s，将继续运行但不显示LED效果", esp_err_to_name(led_init_err));
     }
 
     // 初始化ADC模拟麦克风
     esp_err_t init_err = init_adc_microphone();
     if (init_err != ESP_OK) {
-        ESP_LOGE(TAG, "================================================");
-        ESP_LOGE(TAG, "ADC模拟麦克风初始化失败！");
-        ESP_LOGE(TAG, "错误代码: %s (0x%x)", esp_err_to_name(init_err), init_err);
-        ESP_LOGE(TAG, "================================================");
-        ESP_LOGE(TAG, "可能的原因:");
-        ESP_LOGE(TAG, "1. GPIO引脚不支持ADC（ESP32-C3只支持GPIO0-4）");
-        ESP_LOGE(TAG, "2. 硬件连接错误");
-        ESP_LOGE(TAG, "3. ADC配置错误");
-        ESP_LOGE(TAG, "================================================");
-        ESP_LOGE(TAG, "程序将退出...");
+        AUDIO_LOGE(TAG, "================================================");
+        AUDIO_LOGE(TAG, "ADC模拟麦克风初始化失败！");
+        AUDIO_LOGE(TAG, "错误代码: %s (0x%x)", esp_err_to_name(init_err), init_err);
+        AUDIO_LOGE(TAG, "================================================");
+        AUDIO_LOGE(TAG, "可能的原因:");
+        AUDIO_LOGE(TAG, "1. GPIO引脚不支持ADC（ESP32-C3只支持GPIO0-4）");
+        AUDIO_LOGE(TAG, "2. 硬件连接错误");
+        AUDIO_LOGE(TAG, "3. ADC配置错误");
+        AUDIO_LOGE(TAG, "================================================");
+        AUDIO_LOGE(TAG, "程序将退出...");
         return;
     }
 
@@ -655,7 +673,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     // 开始ADC模拟麦克风测试
-    ESP_LOGI(TAG, "=== 开始ADC模拟麦克风测试 ===");
+    AUDIO_LOGI(TAG, "=== 开始ADC模拟麦克风测试 ===");
     start_mic_test();
 
     // 等待测试完成
@@ -664,26 +682,26 @@ void app_main(void)
     // 清理资源
     cleanup_adc();
 
-    ESP_LOGI(TAG, "ESP32-C3 ADC模拟麦克风测试程序执行完成");
-    ESP_LOGI(TAG, "测试结果说明:");
-    ESP_LOGI(TAG, "如果看到持续变化的ADC数据，说明模拟麦克风工作正常");
-    ESP_LOGI(TAG, "正常情况下应该看到:");
-    ESP_LOGI(TAG, "  - RMS值在10-500范围内变化（取决于声音大小）");
-    ESP_LOGI(TAG, "  - 电压值在合理范围内变化（通常几百到一千多mV）");
-    ESP_LOGI(TAG, "  - 样本值围绕0上下波动");
-    ESP_LOGI(TAG, "ESP32-C3 ADC功能说明:");
-    ESP_LOGI(TAG, "- ADC1支持GPIO0-4，共5个通道");
-    ESP_LOGI(TAG, "- 12位分辨率，0-4095范围");
-    ESP_LOGI(TAG, "- 11dB衰减支持0-2500mV测量范围");
-    ESP_LOGI(TAG, "- 采样率通过软件定时器控制，实际采样率可能略低于目标值");
-    ESP_LOGI(TAG, "如果数据始终为0或不变，可能的原因:");
-    ESP_LOGI(TAG, "1. 硬件连接错误（ADC输入引脚）");
-    ESP_LOGI(TAG, "2. 麦克风电源供电不足");
-    ESP_LOGI(TAG, "3. GPIO引脚不支持ADC（ESP32-C3只支持GPIO0-4）");
-    ESP_LOGI(TAG, "4. 信号幅度太小，需要放大电路");
-    ESP_LOGI(TAG, "建议: 检查硬件连接、电源供应，确认使用支持ADC的GPIO引脚");
+    AUDIO_LOGI(TAG, "ESP32-C3 ADC模拟麦克风测试程序执行完成");
+    AUDIO_LOGI(TAG, "测试结果说明:");
+    AUDIO_LOGI(TAG, "如果看到持续变化的ADC数据，说明模拟麦克风工作正常");
+    AUDIO_LOGI(TAG, "正常情况下应该看到:");
+    AUDIO_LOGI(TAG, "  - RMS值在10-500范围内变化（取决于声音大小）");
+    AUDIO_LOGI(TAG, "  - 电压值在合理范围内变化（通常几百到一千多mV）");
+    AUDIO_LOGI(TAG, "  - 样本值围绕0上下波动");
+    AUDIO_LOGI(TAG, "ESP32-C3 ADC功能说明:");
+    AUDIO_LOGI(TAG, "- ADC1支持GPIO0-4，共5个通道");
+    AUDIO_LOGI(TAG, "- 12位分辨率，0-4095范围");
+    AUDIO_LOGI(TAG, "- 11dB衰减支持0-2500mV测量范围");
+    AUDIO_LOGI(TAG, "- 采样率通过软件定时器控制，实际采样率可能略低于目标值");
+    AUDIO_LOGI(TAG, "如果数据始终为0或不变，可能的原因:");
+    AUDIO_LOGI(TAG, "1. 硬件连接错误（ADC输入引脚）");
+    AUDIO_LOGI(TAG, "2. 麦克风电源供电不足");
+    AUDIO_LOGI(TAG, "3. GPIO引脚不支持ADC（ESP32-C3只支持GPIO0-4）");
+    AUDIO_LOGI(TAG, "4. 信号幅度太小，需要放大电路");
+    AUDIO_LOGI(TAG, "建议: 检查硬件连接、电源供应，确认使用支持ADC的GPIO引脚");
 
     // 进入深度睡眠
-    ESP_LOGI(TAG, "进入深度睡眠...");
+    AUDIO_LOGI(TAG, "进入深度睡眠...");
     // esp_deep_sleep_start();
 }
