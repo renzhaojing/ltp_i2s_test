@@ -53,7 +53,7 @@ static const char *TAG = "ADC_MIC_TEST";
 #define SAMPLE_RATE            8000    // 目标采样率8kHz（软件定时器实际约500-1000Hz）
 #define BITS_PER_SAMPLE        12      // ADC为12位
 #define BUFFER_SIZE            50      // 读取缓冲区大小（样本数）- 约6.25ms数据，极快响应
-#define RECORD_DURATION_MS     120000   // 20秒录音
+#define RECORD_DURATION_MS     600000   // 20秒录音
 #define ADC_SAMPLE_INTERVAL_US (1000000 / SAMPLE_RATE)  // 采样间隔（微秒）
 #define AUDIO_UPDATE_INTERVAL_MS 50   // 音频统计更新间隔（50ms），更快响应
 #define LED_UPDATE_INTERVAL_MS 50     // LED更新间隔（50ms），更快响应
@@ -266,7 +266,7 @@ static void mic_test_task(void *arg)
             int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
             float volume_percent = 0.0f;
             const int PEAK_LOW = 5;    // 进一步降低阈值，提高灵敏度（正常说话也能检测）
-            const int PEAK_HIGH = 200; // 降低高音量阈值，让正常说话也能达到较高百分比
+            const int PEAK_HIGH = 100; // 降低高音量阈值，让正常说话就能达到高百分比
             if (peak_to_peak > PEAK_LOW) {
                 // 使用平方根映射，增强低音量响应
                 float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
@@ -321,8 +321,8 @@ static void mic_test_task(void *arg)
                 
                 // 使用峰峰值作为主要音量指标（更敏感）
                 const int PEAK_LOW = 5;     // 峰峰值阈值：低音量（进一步降低，正常说话也能检测）
-                const int PEAK_MID = 80;    // 峰峰值阈值：中音量（降低）
-                const int PEAK_HIGH = 200;  // 峰峰值阈值：高音量（降低，让正常说话也能达到中高音量）
+                const int PEAK_MID = 50;    // 峰峰值阈值：中音量（降低，让正常说话就能达到中音量）
+                const int PEAK_HIGH = 100;  // 峰峰值阈值：高音量（降低，让正常说话就能达到高音量）
                 
                 // RMS相对变化（相对于基线）
                 float rms_change = 0.0f;
@@ -496,10 +496,11 @@ static void led_control_task(void *arg)
             }
             
             // 根据峰峰值计算要亮的LED数量
-            // 使用非线性映射，让低音量也能点亮更多LED
+            // 降低阈值范围，让更低的声音段也能看到明显效果
+            // 例如：10-100的峰峰值范围就能实现1-16个LED全亮
             int led_count = 0;
-            const int PEAK_MIN = 5;    // 最小峰峰值阈值（进一步降低，提高灵敏度）
-            const int PEAK_MAX = 300;   // 最大峰峰值（降低范围，让正常说话也能触发更多LED）
+            const int PEAK_MIN = 5;    // 最小峰峰值阈值（触发LED）
+            const int PEAK_MAX = 100;   // 最大峰峰值（降低范围，让正常说话就能触发全亮）
             
             if (peak_to_peak > PEAK_MIN) {
                 // 使用平方根映射，让低音量范围有更大的响应
