@@ -281,8 +281,8 @@ static void mic_test_task(void *arg)
             // 总是更新音频数据到共享结构体（用于LED控制，实时响应）
             int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
             float volume_percent = 0.0f;
-            const int PEAK_LOW = 5;    // 进一步降低阈值，提高灵敏度（正常说话也能检测，峰峰值<=4时静音）
-            const int PEAK_HIGH = 15;  // 进一步降低高音量阈值，让远距离也能达到高百分比
+            const int PEAK_LOW = 11;   // 调高阈值，降低灵敏度（峰峰值<=10时静音）
+            const int PEAK_HIGH = 25;  // 调高阈值，降低低音量灵敏度
             if (peak_to_peak > PEAK_LOW) {
                 // 使用更激进的映射，增强低音量响应
                 float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
@@ -331,16 +331,16 @@ static void mic_test_task(void *arg)
                 static bool baseline_set = false;
                 
                 // 初始化基线（静音时的RMS值）
-                if (!baseline_set && peak_to_peak < 20) {
+                if (!baseline_set && peak_to_peak <= 10) {
                     baseline_rms = rms;
                     baseline_set = true;
                     AUDIO_LOGI(TAG, "  📊 设置静音基线: RMS=%.1f", baseline_rms);
                 }
                 
                 // 使用峰峰值作为主要音量指标（更敏感）
-                const int PEAK_LOW = 5;     // 峰峰值阈值：低音量（进一步降低，正常说话也能检测）
-                const int PEAK_MID = 10;    // 峰峰值阈值：中音量（进一步降低，让远距离也能达到中音量）
-                const int PEAK_HIGH = 15;   // 峰峰值阈值：高音量（进一步降低，让远距离也能达到高音量）
+                const int PEAK_LOW = 11;    // 峰峰值阈值：低音量（调高阈值，降低灵敏度，峰峰值<=10时静音）
+                const int PEAK_MID = 18;    // 峰峰值阈值：中音量（调高阈值）
+                const int PEAK_HIGH = 25;   // 峰峰值阈值：高音量（调高阈值，降低低音量灵敏度）
                 
                 // RMS相对变化（相对于基线）
                 float rms_change = 0.0f;
@@ -366,8 +366,8 @@ static void mic_test_task(void *arg)
                 // 音量强度百分比（基于峰峰值，归一化到0-100%）
                 // 注意：这里的volume_percent仅用于日志显示，LED控制使用的是上面计算的volume_percent
                 float volume_percent_log = 0.0f;
-                const int PEAK_LOW_LOG = 5;
-                const int PEAK_HIGH_LOG = 15;  // 与LED控制保持一致
+                const int PEAK_LOW_LOG = 11;
+                const int PEAK_HIGH_LOG = 25;  // 与LED控制保持一致
                 if (peak_to_peak > PEAK_LOW_LOG) {
                     float normalized = ((float)(peak_to_peak - PEAK_LOW_LOG) / (PEAK_HIGH_LOG - PEAK_LOW_LOG));
                     if (normalized > 1.0f) normalized = 1.0f;
@@ -380,7 +380,7 @@ static void mic_test_task(void *arg)
                 last_print_time = elapsed;
                 
                 // 判断数据变化情况
-                if (peak_to_peak < 10) {
+                if (peak_to_peak <= 10) {
                     AUDIO_LOGW(TAG, "⚠ 数据变化很小（峰峰值: %d），可能是静音或硬件连接问题", peak_to_peak);
                 } else if (peak_to_peak > 100) {
                     AUDIO_LOGI(TAG, "✓ 检测到明显的声音信号（峰峰值: %d）", peak_to_peak);
@@ -518,12 +518,11 @@ static void led_control_task(void *arg)
             }
             
             // 根据峰峰值计算要亮的LED数量
-            // 进一步降低阈值范围，让更低的声音段也能看到明显效果
-            // 例如：5-15的峰峰值范围就能实现1-16个LED全亮（更激进的映射）
-            // 这样即使距离较远，也能达到和近距离一样灵敏的效果
+            // 调高阈值，降低低音量时的灵敏度
+            // 例如：11-25的峰峰值范围就能实现1-16个LED全亮
             int led_count = 0;
-            const int PEAK_MIN = 5;    // 最小峰峰值阈值（触发LED，峰峰值<=4时亮0个LED）
-            const int PEAK_MAX = 15;   // 最大峰峰值（进一步降低，让远距离也能触发全亮）
+            const int PEAK_MIN = 11;   // 最小峰峰值阈值（触发LED，峰峰值<=10时亮0个LED）
+            const int PEAK_MAX = 25;   // 最大峰峰值（调高阈值，降低低音量灵敏度）
             
             if (peak_to_peak > PEAK_MIN) {
                 // 使用更激进的映射：使用平方根映射，让低音量响应更明显
@@ -538,37 +537,48 @@ static void led_control_task(void *arg)
                 led_count = (int)(normalized * LED_STRIP_NUM) + 1;  // 至少亮1个LED
                 if (led_count > LED_STRIP_NUM) led_count = LED_STRIP_NUM;
             } else {
-                led_count = 0;  // 静音时不亮LED（峰峰值<=4）
+                led_count = 0;  // 静音时不亮LED（峰峰值<=10）
             }
             
             if (led_strip != NULL) {
                 // 清除所有LED
                 ws2812_clear(led_strip);
                 
-                // 根据音量设置LED颜色和亮度
-                // 音量越大，颜色越亮（从绿色->黄色->红色）
-                uint8_t r = 0, g = 0, b = 0;
-                if (volume_percent > 0) {
-                    if (volume_percent < 15.0f) {
-                        // 极低音量：暗绿色（让正常说话也能看到）
-                        g = (uint8_t)(100 + 100 * volume_percent / 15.0f);  // 100-200，更明显
-                    } else if (volume_percent < 40.0f) {
-                        // 低音量：绿色（正常说话范围）
-                        g = (uint8_t)(200 + 55 * (volume_percent - 15.0f) / 25.0f);  // 200-255
-                    } else if (volume_percent < 70.0f) {
-                        // 中音量：黄色（绿+红）
-                        g = 255;
-                        r = (uint8_t)(255 * (volume_percent - 40.0f) / 30.0f);
-                    } else {
-                        // 高音量：红色
-                        r = 255;
-                        g = (uint8_t)(255 * (100.0f - volume_percent) / 30.0f);
-                    }
-                }
-                
                 // 从第1个LED（索引0）开始顺序点亮led_count个LED
-                // 根据声音强弱，依次点亮更多LED
+                // 每个LED的颜色根据其位置固定设置，实现渐变效果
+                // LED 0-10: 绿色渐变到蓝色
+                // LED 10-20: 蓝色渐变到橙色
+                // LED 20-30: 橙色渐变到红色
                 for (int i = 0; i < led_count; i++) {
+                    uint8_t r = 0, g = 0, b = 0;
+                    
+                    if (i < 10) {
+                        // LED 0-9: 绿色渐变到蓝色
+                        // 绿色(0,255,0) -> 蓝色(0,0,255)
+                        float ratio = (float)i / 10.0f;  // 0.0到0.9
+                        g = (uint8_t)(255 * (1.0f - ratio));  // 绿色从255到0
+                        b = (uint8_t)(255 * ratio);  // 蓝色从0到255
+                    } else if (i < 20) {
+                        // LED 10-19: 蓝色渐变到橙色
+                        // 蓝色(0,0,255) -> 橙色(255,165,0)
+                        float ratio = ((float)(i - 10)) / 10.0f;  // 0.0到0.9
+                        b = (uint8_t)(255 * (1.0f - ratio));  // 蓝色从255到0
+                        r = (uint8_t)(255 * ratio);  // 红色从0到255
+                        g = (uint8_t)(165 * ratio);  // 绿色从0到165（橙色）
+                    } else if (i < 30) {
+                        // LED 20-29: 橙色渐变到红色
+                        // 橙色(255,165,0) -> 红色(255,0,0)
+                        float ratio = ((float)(i - 20)) / 10.0f;  // 0.0到0.9
+                        r = 255;  // 红色保持255
+                        g = (uint8_t)(165 * (1.0f - ratio));  // 绿色从165到0
+                        b = 0;  // 蓝色保持0
+                    } else {
+                        // LED 30及以上: 红色
+                        r = 255;
+                        g = 0;
+                        b = 0;
+                    }
+                    
                     // 渐变效果：前面的LED最亮，后面的逐渐变暗
                     float brightness = 1.0f;
                     if (led_count > 1) {
@@ -581,7 +591,8 @@ static void led_control_task(void *arg)
                     uint8_t led_b = (uint8_t)(b * brightness);
                     
                     // 从LED 0开始顺序点亮
-                    ws2812_set_pixel(led_strip, i, led_r, led_g, led_b);
+                    // 注意：当前LED灯带的R和B通道交换了，所以交换参数位置
+                    ws2812_set_pixel(led_strip, i, led_b, led_g, led_r);
                 }
                 
                 // 刷新LED显示
