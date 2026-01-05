@@ -266,11 +266,13 @@ static void mic_test_task(void *arg)
             int16_t peak_to_peak = max_sample - min_sample;  // 峰峰值
             float volume_percent = 0.0f;
             const int PEAK_LOW = 5;    // 进一步降低阈值，提高灵敏度（正常说话也能检测）
-            const int PEAK_HIGH = 100; // 降低高音量阈值，让正常说话就能达到高百分比
+            const int PEAK_HIGH = 50;  // 进一步降低高音量阈值，让正常说话就能达到高百分比
             if (peak_to_peak > PEAK_LOW) {
-                // 使用平方根映射，增强低音量响应
+                // 使用更激进的映射，增强低音量响应
                 float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
+                if (normalized > 1.0f) normalized = 1.0f;  // 限制在0-1范围
                 normalized = sqrtf(normalized);  // 平方根映射
+                normalized = normalized * normalized;  // 平方，让低音量响应更明显
                 volume_percent = normalized * 100.0f;
                 if (volume_percent > 100.0f) volume_percent = 100.0f;
             }
@@ -321,8 +323,8 @@ static void mic_test_task(void *arg)
                 
                 // 使用峰峰值作为主要音量指标（更敏感）
                 const int PEAK_LOW = 5;     // 峰峰值阈值：低音量（进一步降低，正常说话也能检测）
-                const int PEAK_MID = 50;    // 峰峰值阈值：中音量（降低，让正常说话就能达到中音量）
-                const int PEAK_HIGH = 100;  // 峰峰值阈值：高音量（降低，让正常说话就能达到高音量）
+                const int PEAK_MID = 25;    // 峰峰值阈值：中音量（进一步降低）
+                const int PEAK_HIGH = 50;   // 峰峰值阈值：高音量（进一步降低，让正常说话就能达到高音量）
                 
                 // RMS相对变化（相对于基线）
                 float rms_change = 0.0f;
@@ -348,9 +350,13 @@ static void mic_test_task(void *arg)
                 // 音量强度百分比（基于峰峰值，归一化到0-100%）
                 // 注意：这里的volume_percent仅用于日志显示，LED控制使用的是上面计算的volume_percent
                 float volume_percent_log = 0.0f;
-                if (peak_to_peak > PEAK_LOW) {
-                    float normalized = ((float)(peak_to_peak - PEAK_LOW) / (PEAK_HIGH - PEAK_LOW));
-                    normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
+                const int PEAK_LOW_LOG = 5;
+                const int PEAK_HIGH_LOG = 50;  // 与LED控制保持一致
+                if (peak_to_peak > PEAK_LOW_LOG) {
+                    float normalized = ((float)(peak_to_peak - PEAK_LOW_LOG) / (PEAK_HIGH_LOG - PEAK_LOW_LOG));
+                    if (normalized > 1.0f) normalized = 1.0f;
+                    normalized = sqrtf(normalized);  // 平方根映射
+                    normalized = normalized * normalized;  // 平方，增强低音量响应
                     volume_percent_log = normalized * 100.0f;
                     if (volume_percent_log > 100.0f) volume_percent_log = 100.0f;
                 }
@@ -496,17 +502,21 @@ static void led_control_task(void *arg)
             }
             
             // 根据峰峰值计算要亮的LED数量
-            // 降低阈值范围，让更低的声音段也能看到明显效果
-            // 例如：10-100的峰峰值范围就能实现1-16个LED全亮
+            // 进一步降低阈值范围，让更低的声音段也能看到明显效果
+            // 例如：5-50的峰峰值范围就能实现1-16个LED全亮（更激进的映射）
             int led_count = 0;
             const int PEAK_MIN = 5;    // 最小峰峰值阈值（触发LED）
-            const int PEAK_MAX = 100;   // 最大峰峰值（降低范围，让正常说话就能触发全亮）
+            const int PEAK_MAX = 50;   // 最大峰峰值（进一步降低，让正常说话就能触发全亮）
             
             if (peak_to_peak > PEAK_MIN) {
-                // 使用平方根映射，让低音量范围有更大的响应
-                // 这样正常说话（低音量）也能点亮更多LED
+                // 使用更激进的映射：先平方根，再平方，增强低音量响应
+                // 这样更小的声音变化也能产生更大的LED数量变化
                 float normalized = ((float)(peak_to_peak - PEAK_MIN) / (PEAK_MAX - PEAK_MIN));
-                normalized = sqrtf(normalized);  // 平方根映射，增强低音量响应
+                if (normalized > 1.0f) normalized = 1.0f;  // 限制在0-1范围
+                // 使用平方根映射，让低音量范围有更大的响应
+                normalized = sqrtf(normalized);
+                // 进一步放大低音量响应：使用平方函数
+                normalized = normalized * normalized;  // 平方，让低音量响应更明显
                 led_count = (int)(normalized * LED_STRIP_NUM) + 1;  // 至少亮1个LED
                 if (led_count > LED_STRIP_NUM) led_count = LED_STRIP_NUM;
             } else {
